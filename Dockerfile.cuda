@@ -1,0 +1,101 @@
+# Verdict serving image (CUDA): the CPU image plus an onnxruntime built
+# for the CUDA execution provider and the CUDA libraries it links against.
+#
+# Build (the ~1.5 GB wheel set arrives as a named context so it never enters
+# the main build context; fetch it with bench/gpu-box/fetch_wheels.py):
+#   docker buildx build -f Dockerfile.cuda \
+#     --build-context cudawheels=<wheel-dir> \
+#     --platform linux/amd64 -t <ns>/verdict:0.1.0-cuda --load .
+# Run:  docker run --gpus all -p 8080:8080 -v $PWD/<model-dir>:/model:ro \
+#           verdict:0.1.0-cuda
+#
+# `--gpus all` is not optional: without the host's NVIDIA runtime injecting
+# the driver, the engine finds no CUDA and quietly serves on CPU.
+# STATUS: validated on real NVIDIA hardware -- full golden corpus over HTTP,
+# 40/40 (laya) + 43/43 (laya-multilingual) within 1e-4 of the official model.
+
+# ---- extract the CUDA library set from the wheels ------------------------
+FROM debian:trixie-slim AS cuda
+RUN apt-get update && apt-get install -y --no-install-recommends unzip \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=cudawheels / /tmp/wheels/
+RUN set -eux; \
+    mkdir -p /ort /cudalibs; \
+    unzip -j -o /tmp/wheels/onnxruntime_gpu-*.whl 'onnxruntime/capi/libonnxruntime*.so*' -d /ort; \
+    for w in /tmp/wheels/nvidia_*.whl; do \
+      unzip -j -o "$w" 'nvidia/*/lib/*.so*' -d /cudalibs; \
+    done; \
+    ls -l /ort; echo "cuda libs: $(ls /cudalibs | wc -l)"; \
+    # Wildcards on purpose (names change between versions); the test -f pair
+    # below is what fails the build when a provider library goes missing --
+    # a session whose CUDA provider is absent starts fine and runs on CPU.
+    test -f /ort/libonnxruntime_providers_cuda.so; \
+    test -f /ort/libonnxruntime_providers_shared.so
+
+# ---- builder (same shape as the CPU image) -------------------------------
+FROM rust:1.90-slim AS builder
+WORKDIR /build
+
+# CARGO_MIRROR=<sparse index> routes cargo through a mirror on slow routes.
+ARG CARGO_MIRROR=""
+RUN if [ -n "$CARGO_MIRROR" ]; then \
+      printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n' \
+        "$CARGO_MIRROR" > "${CARGO_HOME:-/usr/local/cargo}/config.toml"; \
+    fi
+
+# g++ (cc-rs builds C/C++); its own RUN above the COPYs so src-only changes
+# reuse the cached layer.
+RUN apt-get update && apt-get install -y --no-install-recommends g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# `cargo build --release` compiles the lib and bins, never the tests:
+# only the manifest + src are needed.
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+# Cache mounts survive across builds, so src-only changes recompile only
+# this crate. Mount contents are NOT in the layer snapshot: the binary must
+# be copied out in the SAME RUN -- a later COPY of target/ fails "not found".
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release && cp target/release/verdict ./verdict
+
+# ---- runtime ------------------------------------------------------------
+FROM debian:trixie-slim
+
+# No maintainer/author fields: published artifacts carry no personal
+# identifiers. VERSION/REVISION come from the build script.
+ARG VERSION=0.0.0
+ARG REVISION=
+LABEL org.opencontainers.image.title="Verdict (CUDA)" \
+      org.opencontainers.image.description="A high-performance serving engine for System One decision models (CUDA execution provider)" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.source="https://github.com/sgyaqing/verdict" \
+      org.opencontainers.image.url="https://github.com/sgyaqing/verdict" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+# Must match the builder's glibc generation (rust:1.90-slim = trixie); a
+# bookworm runtime fails with GLIBC_2.38-not-found.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Tells the NVIDIA container runtime what to inject (the pair nvidia/cuda
+# base images set).
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+WORKDIR /app
+COPY --from=builder /build/verdict /usr/local/bin/verdict
+# Ship everything the wheel's capi/ carries, including the EP plugins it
+# loads by soname: without providers_cuda.so the provider never loads and
+# the engine serves on CPU.
+COPY --from=cuda /ort/ /usr/local/lib/
+COPY --from=cuda /cudalibs/ /usr/local/lib/
+RUN ln -s libonnxruntime.so.1.30.0 /usr/local/lib/libonnxruntime.so \
+    && ldconfig
+
+VOLUME /model
+EXPOSE 8080
+ENTRYPOINT ["verdict"]
+CMD ["serve", "/model", "--host", "0.0.0.0", "--port", "8080"]

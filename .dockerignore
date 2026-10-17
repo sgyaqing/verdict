@@ -1,0 +1,6 @@
+# Whitelist: the build consumes exactly these paths; everything else stays
+# out of the context no matter what the local tree holds.
+*
+!Cargo.toml
+!Cargo.lock
+!src

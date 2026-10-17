@@ -1,0 +1,51 @@
+[package]
+name = "verdict-serve"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "A high-performance serving engine for System One decision models"
+repository = "https://github.com/sgyaqing/verdict"
+keywords = ["llm-serving", "inference", "onnx", "decision-models", "serving"]
+categories = ["web-programming::http-server"]
+exclude = [
+    ".github/",
+]
+
+[lib]
+name = "verdict"
+
+[[bin]]
+name = "verdict"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8.9"
+# Stream adapters for the SSE chat surface; already in the graph via
+# axum -- declaring it only makes the direct use legal, default-features off.
+futures-util = { version = "0.3", default-features = false }
+# sync ureq client only -- no reqwest/tokio side, no xet
+hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
+# direct use of an hf-hub transitive dep
+ureq = "2.12"
+indicatif = "0.17"
+metrics = "0.23.1"
+metrics-exporter-prometheus = "0.15.1"
+ndarray = "0.17"
+# load-dynamic: the shared library loads at runtime via ORT_DYLIB_PATH, no
+# build-time linking. default-features off drops download-binaries, which
+# would fetch the wrong onnxruntime version.
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic", "cuda"] }
+serde = { version = "1.0.229", features = ["derive"] }
+# preserve_order: answer maps must keep arrival order (Python/JS semantics)
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+thiserror = "2.0.21"
+tokenizers = "0.23.2"
+# already in the graph via axum/tower; declared for direct use
+futures = "0.3"
+tokio = { version = "1.53.2", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1.5"
+tower = "0.5.3"

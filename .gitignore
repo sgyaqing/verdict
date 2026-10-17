@@ -1,0 +1,10 @@
+.DS_Store
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+/target
+
+# Bench output: generated and box-specific -- run the scripts for your
+# own numbers.
+bench/results/
