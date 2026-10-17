@@ -5,6 +5,7 @@ __pycache__/
 node_modules/
 /target
 
-# Bench output: generated and box-specific -- run the scripts for your
-# own numbers.
+# Local output and caches (machine-specific, never part of the repo)
 bench/results/
+.gpu-box-backup/
+dist/

@@ -2,17 +2,14 @@
 //! mixed-task flow + ragged-K collate + padded-token budget admission.
 //!
 //! Reference patterns:
-//! - TEI `core/src/queue.rs` `queue_blocking_task`: padded-cost admission
-//!   `max(max_length, entry_len) * (n + 1) > budget` -> the entry stays queued
-//!   (never dropped); entries whose responder was dropped (client gone) are
-//!   skipped at batch time.
-//! - TEI `core/src/infer.rs` `backend_task`: a batch error propagates to EVERY
-//!   responder in that batch; the head of a batch is always admissible so the
-//!   budget can never starve a request.
-//! - vLLM `v1/core/sched/scheduler.py` `schedule`: token budget decremented
-//!   across admissions each step.
+//! - padded-cost admission: `max(max_length, entry_len) * (n + 1) > budget`
+//!   keeps the entry queued (never dropped); entries whose responder was
+//!   dropped (client gone) are skipped at batch time.
+//! - a batch error propagates to EVERY responder in that batch; the head of a
+//!   batch is always admissible so the budget can never starve a request.
+//! - the token budget is decremented across admissions each step.
 //!
-//! Five invariants (each verified
+//! Five invariants (each pinned by a test in tests/scheduler.rs, each verified
 //! under mutation):
 //! 1. every submitted request eventually receives a response (success or error)
 //! 2. responses map back to their own request, never crossed
@@ -31,6 +28,12 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use crate::tokenize::{BuiltSequence, Layout};
+
+/// Adaptive window probe quantum: how long a LONE queued request waits for
+/// company before being dispatched alone. Small enough to disappear in the
+/// noise next to a 5 ms graph forward, large enough to catch back-to-back
+/// arrivals from one caller.
+const PROBE_QUANTUM: Duration = Duration::from_micros(500);
 
 /// Raw (uncalibrated) per-option logits; calibration happens after the scheduler.
 pub type RawLogits = Vec<f64>;
@@ -119,6 +122,9 @@ pub struct CollatedBatch {
     pub marker_pos: Vec<i64>,
     pub marker_mask: Vec<bool>,
     pub qtype: Vec<i64>,
+    /// Letter-readout dialect: option count per request (its single slot's
+    /// width). Empty for the marker dialects, whose `k` already carries it.
+    pub nopts: Vec<i64>,
     pub b: usize,
     pub l: usize,
     pub k: usize,
@@ -133,15 +139,30 @@ pub struct RowMeta {
 }
 
 /// Blocking batch inference. Runs ONLY inside `spawn_blocking` (invariant 5).
-/// Contract: returns one row per input row, in batch order, each of length `k`
-/// (the graph emits -1e4 at masked slots, which the scheduler trims).
+/// Contract: returns one row per input row, in batch order, each at least
+/// `real_k` long (the graph emits -1e4 at masked slots, which the scheduler
+/// trims).
 pub type BatchRunner = Arc<dyn Fn(CollatedBatch) -> Result<Vec<Vec<f64>>, String> + Send + Sync>;
 
 /// Right-pad every row to the batch max length, pad marker slots to the batch
 /// max marker count (marker_pos 0 / marker_mask false), one qtype per row.
 pub fn collate(items: &[ScheduledRequest], layout: &Layout) -> CollatedBatch {
     let b = items.len();
-    let l = items.iter().map(|r| r.built.ids.len()).max().unwrap_or(0);
+    let mut l = items.iter().map(|r| r.built.ids.len()).max().unwrap_or(0);
+    if !layout.fixed_classes.is_empty() {
+        // Static-S sessions: pad to the smallest class that fits. A batch
+        // longer than the largest class keeps its own length -- the engine
+        // then fails it loudly (no session matches) instead of truncating.
+        if let Some(&class) = layout.fixed_classes.iter().find(|&&c| c >= l) {
+            l = class;
+        }
+    } else if layout.seq_align > 1 {
+        // Some graphs require padded lengths to be a multiple of an internal
+        // chunk size (e.g. Qwen3.5 linear attention = 64); the CUDA EP rejects
+        // unaligned lengths. Manifest-driven via `seq_align` in model.json —
+        // extra pad tokens with attention_mask=0 are semantically inert.
+        l = l.div_ceil(layout.seq_align) * layout.seq_align;
+    }
     let k = items
         .iter()
         .map(|r| r.built.markers.len())
@@ -152,6 +173,7 @@ pub fn collate(items: &[ScheduledRequest], layout: &Layout) -> CollatedBatch {
     let mut marker_pos = vec![0i64; b * k];
     let mut marker_mask = vec![false; b * k];
     let mut qtype = Vec::with_capacity(b);
+    let mut nopts = Vec::with_capacity(b);
     let mut rows = Vec::with_capacity(b);
     for (i, req) in items.iter().enumerate() {
         let real_len = req.built.ids.len();
@@ -164,10 +186,11 @@ pub fn collate(items: &[ScheduledRequest], layout: &Layout) -> CollatedBatch {
             marker_mask[i * k + j] = true;
         }
         qtype.push(crate::calibration::qtype_of(&req.task).unwrap_or(0) as i64);
-        rows.push(RowMeta {
-            real_len,
-            real_k: req.built.markers.len(),
-        });
+        let real_k = req.built.real_k();
+        if !req.built.nopts.is_empty() {
+            nopts.push(real_k as i64);
+        }
+        rows.push(RowMeta { real_len, real_k });
     }
     CollatedBatch {
         input_ids,
@@ -175,6 +198,7 @@ pub fn collate(items: &[ScheduledRequest], layout: &Layout) -> CollatedBatch {
         marker_pos,
         marker_mask,
         qtype,
+        nopts,
         b,
         l,
         k,
@@ -238,8 +262,8 @@ impl SchedulingPolicy for Fcfs {
     }
 }
 
-/// Priority policy (vLLM `policy=priority` semantics, request_queue.py +
-/// request.py: smaller `priority` first, earlier arrival as tiebreak).
+/// Priority policy (vLLM `policy=priority` semantics: smaller `priority`
+/// first, earlier arrival as tiebreak).
 /// Sorting is O(n log n) per window, n bounded by queue_cap.
 pub struct Priority;
 
@@ -368,6 +392,15 @@ async fn batching_task(
         // Window fill: gather more arrivals until the batch is full or the
         // window elapses. Buffered arrivals return instantly, so the window
         // only costs real waiting when intake runs dry.
+        //
+        // The window exists to let a batch fill under load, but a LONE
+        // request on an idle server would otherwise pay the whole window --
+        // on a fast engine the default is a visible share of the response.
+        // So the wait is probed in short
+        // quanta: with a second request already pending (traffic flowing)
+        // the full window still applies; a lone request dispatches after one
+        // quantum. Under load the queue fills faster than the probe, so the
+        // batching behavior is unchanged where batching matters.
         if open && pending.len() < cfg.max_batch_size {
             let deadline = tokio::time::Instant::now() + cfg.batch_window;
             while pending.len() < cfg.max_batch_size {
@@ -375,13 +408,19 @@ async fn batching_task(
                 if remaining.is_zero() {
                     break;
                 }
-                match timeout(remaining, rx.recv()).await {
+                let quantum = remaining.min(PROBE_QUANTUM);
+                match timeout(quantum, rx.recv()).await {
                     Ok(Some(req)) => pending.push_back(req),
                     Ok(None) => {
                         open = false;
                         break;
                     }
-                    Err(_) => break, // window elapsed
+                    Err(_) => {
+                        if pending.len() < 2 {
+                            break; // lone request: nothing to wait for
+                        }
+                        // traffic is flowing: keep filling until the window
+                    }
                 }
             }
         }
@@ -416,7 +455,7 @@ async fn backend_task(runner: BatchRunner, mut job_rx: mpsc::Receiver<Job>) {
         match result {
             Ok(Ok(rows)) if rows.len() == items.len() => {
                 for (req, row) in items.into_iter().zip(rows) {
-                    let real_k = req.built.markers.len();
+                    let real_k = req.built.real_k();
                     if row.len() < real_k {
                         let _ = req.respond.send(Err(SchedulerError::Engine(format!(
                             "engine returned {} markers for a request with {real_k}",

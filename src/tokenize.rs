@@ -1,46 +1,20 @@
-//! Sequence construction: prompt rendering + encoding + collate constants.
+//! Sequence construction: tokenizer + layout loading and the family dispatch.
+//! The rendering/truncation recipe itself lives in the family profile
+//! (`crate::family`); this module owns the generic machinery (tokenizer
+//! access, special-token resolution, manifest layout) that recipes share.
 //!
-//! Every rule is re-typed from rl_common.py (build_sequence / render_options /
-//! serialize_state) and pinned by the golden vectors; authoritative facts
-//! live in each golden file's `meta`
-//! block.
-//!
-//! Special-token names are externalized to model.json (DEFAULT_*_TOKEN) so a
-//! differently named tokenizer loads unchanged; the remaining constants are
-//! the first family's (Laya / ModernBERT) and not per-model yet. Do not grow
-//! new family specifics here.
+//! Special-token names are externalized to model.json so a differently named
+//! tokenizer loads unchanged; ids are resolved from the tokenizer at load
+//! time, never hardcoded. A wrong name is not a silent failure: the vocab
+//! lookup misses and `load` fails loudly.
+
+use crate::family::letter_readout::MAX_OPTIONS;
 
 use std::path::Path;
 
 use thiserror::Error;
 
-/// Default special-token surface forms: the first family's (Laya / ModernBERT).
-/// A model whose tokenizer names them differently declares all four in
-/// model.json -- mmBERT uses `<bos>`/`<eos>`/`<mask>`/`<pad>`. A wrong name is
-/// not a silent failure: the vocab lookup misses and `load` fails loudly.
-const DEFAULT_CLS_TOKEN: &str = "[CLS]";
-const DEFAULT_SEP_TOKEN: &str = "[SEP]";
-const DEFAULT_MASK_TOKEN: &str = "[MASK]";
-const DEFAULT_PAD_TOKEN: &str = "[PAD]";
-/// Per-option token cap: one mask token + at most 48 text tokens (rl_common line 60).
-const OPT_TEXT_CAP: usize = 48;
-/// If the option block leaves less head budget than this, every option is shrunk
-/// evenly and the head shrinks to the remainder (rl_common lines 62-66).
-const MIN_HEAD_BUDGET: usize = 16;
-/// Options may never shrink below this many tokens (rl_common line 63).
-const MIN_OPT_TOKENS: usize = 4;
-/// The fixed noul pair (rl_common.render_options): `p[1] == P(true)` depends
-/// on this exact wording. The bare descriptions back the /v1/systemone
-/// adapter's one-sided Jev criteria fallback; PAIR[i] is
-/// `"{false|true}: {DESCRIPTIONS[i]}"`.
-pub const NOUL_DEFAULT_PAIR: [&str; 2] = [
-    "false: no, the statement does not hold",
-    "true: yes, the statement holds",
-];
-pub const NOUL_DEFAULT_DESCRIPTIONS: [&str; 2] = [
-    "no, the statement does not hold",
-    "yes, the statement holds",
-];
+use crate::family::Family;
 
 #[derive(Debug, Error)]
 pub enum TokenizeError {
@@ -58,6 +32,10 @@ pub enum TokenizeError {
     ConfigParse(#[from] serde_json::Error),
     #[error("model.json is missing field {0}")]
     MissingConfig(&'static str),
+    #[error("invalid model.json: {0}")]
+    Family(String),
+    #[error("letter table: {0}")]
+    LetterTable(String),
 }
 
 /// Token ids and length budgets pinned by the golden corpus meta.
@@ -68,19 +46,45 @@ pub struct Layout {
     pub sep_id: u32,
     pub mask_id: u32,
     pub pad_id: u32,
+    /// Serving sequence ceiling: the padding bound and (for the
+    /// independent-options family) the state-fit window.
     pub max_len: usize,
+    /// Head budget for the marker-head family's shrink path; the
+    /// independent-options family has no head budget (value = max_len).
     pub head_max_len: usize,
-    /// The mask token's surface form. Literal occurrences in user text are
-    /// replaced by a space before encoding (mask_tok hygiene,
-    /// rl_common.build_sequence); taken from the tokenizer's own name for the
-    /// token.
+    /// The mask token's surface form; recipes use it both as the option
+    /// marker and for user-text hygiene.
     pub mask_literal: String,
+    /// The separator token's surface form (packing and hygiene).
+    pub sep_literal: String,
+    /// Sequence-length alignment for the collate pad (model.json's
+    /// `seq_align`; default 1 = no alignment). Some execution providers
+    /// require padded lengths to be a multiple of the graph's internal
+    /// chunk size (e.g. Qwen3.5 linear attention chunks by 64).
+    pub seq_align: usize,
+    /// Fixed-shape serving classes (model.json's `fixed_shapes` keys,
+    /// ascending; empty = dynamic geometry). The collate pads each batch
+    /// to the smallest class that fits and the engine runs the matching
+    /// static-S session.
+    pub fixed_classes: Vec<usize>,
 }
 
 #[derive(Clone)]
 pub struct TokenizerBundle {
     pub tok: tokenizers::Tokenizer,
     pub layout: Layout,
+    /// Which family recipe builds sequences for this model (model.json's
+    /// `family` key; required, and a missing or unknown value fails the load).
+    pub family: Family,
+    /// Space out every digit run before encoding. **Only the independent-options
+    /// recipe reads it** -- the key is not consulted at all for the other
+    /// families, so their manifests never carry it (see the family-dispatched
+    /// read in the builder below).
+    pub digit_split: bool,
+    /// The letter-readout family's 255 single-token option labels, derived
+    /// from this tokenizer at load (empty for the marker families, which
+    /// have no letter head).
+    pub letter_table: Vec<u32>,
 }
 
 /// A built request sequence: model input ids (right-padding happens at collate
@@ -91,13 +95,77 @@ pub struct BuiltSequence {
     pub ids: Vec<u32>,
     pub markers: Vec<usize>,
     pub full_len: usize,
+    /// Token count of the (fitted) state text, no specials -- the
+    /// formula-temperature feature input; unused by the band-table family.
+    pub state_tokens: usize,
+    /// Letter-readout family: option count per slot (one slot per row here).
+    /// The engine's row for a slot is the first `nopts` entries of the
+    /// 255-wide letter row; `real_k` trims to exactly that.
+    pub nopts: Vec<usize>,
+}
+
+impl BuiltSequence {
+    /// How many real logits the engine returns for this sequence: one per
+    /// marker (marker dialects), or the slot's option count (letter readout).
+    pub fn real_k(&self) -> usize {
+        if self.nopts.is_empty() {
+            self.markers.len()
+        } else {
+            self.nopts.iter().sum()
+        }
+    }
+}
+
+/// Derive the 255 single-token option labels (official label_table): the
+/// upper-case names A..Z, AA, AB, ... keeping every name that encodes to
+/// exactly one token, in that order, until the table is full. Derived from
+/// the tokenizer itself -- never hardcoded -- and loud when a tokenizer
+/// cannot fill the table.
+fn derive_letter_table(tok: &tokenizers::Tokenizer) -> Result<Vec<u32>, TokenizeError> {
+    let single = |name: &str| -> Option<u32> {
+        let enc = tok
+            .encode(name, false)
+            .expect("tokenizer encode cannot fail on &str input");
+        let ids = enc.get_ids();
+        (ids.len() == 1).then(|| ids[0])
+    };
+    let mut out: Vec<u32> = Vec::with_capacity(MAX_OPTIONS);
+    for c in b'A'..=b'Z' {
+        if let Some(id) = single(&(c as char).to_string()) {
+            out.push(id);
+        }
+    }
+    'outer: for a in b'A'..=b'Z' {
+        for b in b'A'..=b'Z' {
+            if out.len() >= MAX_OPTIONS {
+                break 'outer;
+            }
+            if let Some(id) = single(&format!("{}{}", a as char, b as char)) {
+                out.push(id);
+            }
+        }
+    }
+    if out.len() < MAX_OPTIONS {
+        return Err(TokenizeError::LetterTable(format!(
+            "this tokenizer has only {} single-token upper-case letter names; the \
+             letter-readout family needs {MAX_OPTIONS}",
+            out.len()
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if !out.iter().all(|id| seen.insert(*id)) {
+        return Err(TokenizeError::LetterTable(
+            "two option labels tokenize to the same id".into(),
+        ));
+    }
+    Ok(out)
 }
 
 impl TokenizerBundle {
     /// Load from a model directory holding `tokenizer/tokenizer.json` and
     /// `model.json` (model-family specifics live in the manifest, not
-    /// product code).
-    /// (weights are not needed to grade tokenization or calibration).
+    /// product code). Grading tokenization or calibration needs no weights,
+    /// so a directory with just those two files is a valid model dir.
     pub fn load(model_dir: &Path) -> Result<Self, TokenizeError> {
         let tok_path = model_dir.join("tokenizer").join("tokenizer.json");
         let tok = tokenizers::Tokenizer::from_file(&tok_path).map_err(TokenizeError::Tokenizer)?;
@@ -108,6 +176,7 @@ impl TokenizerBundle {
         })?;
         let cfg: serde_json::Value =
             serde_json::from_str(&raw).map_err(TokenizeError::ConfigParse)?;
+        let family = Family::from_manifest(&cfg).map_err(TokenizeError::Family)?;
         let special = |name: &str| {
             tok.token_to_id(name)
                 .ok_or_else(|| TokenizeError::MissingSpecial(name.to_string()))
@@ -118,30 +187,127 @@ impl TokenizerBundle {
                 .map(|v| v as usize)
                 .ok_or(TokenizeError::MissingConfig(key))
         };
-        // Special-token names come from the manifest so a second model
-        // family needs no code change here.
-        let name = |key: &str, default: &str| {
+        let max_len = num("max_len")?;
+        // Special-token names are required, not defaulted: they fence every
+        // row, so a name that disagrees with the tokenizer's own convention
+        // would mis-encode silently. The packager fills them in from the
+        // tokenizer. WHICH names are required is per family -- see the arms.
+        let name = |key: &'static str| -> Result<String, TokenizeError> {
             cfg.get(key)
                 .and_then(|v| v.as_str())
-                .unwrap_or(default)
-                .to_string()
+                .map(str::to_string)
+                .ok_or(TokenizeError::MissingConfig(key))
         };
-        let mask_token = name("mask_token", DEFAULT_MASK_TOKEN);
+        let pad_token = name("pad_token")?;
+        // The head budget only exists in the marker-head recipe; the other
+        // recipes have no head structure (max_len stands in so downstream
+        // budget arithmetic stays total).
+        let head_max_len = match family {
+            Family::MarkerHead => num("head_max_len")?,
+            Family::IndependentOptions | Family::LetterReadout => cfg
+                .get("head_max_len")
+                .and_then(|v| v.as_u64())
+                .map_or(max_len, |v| v as usize),
+        };
+        let layout = match family {
+            // The letter-readout recipe assembles no premise/option structure
+            // (its row builder in family/letter_readout.rs never reads
+            // mask_literal or sep_literal), so pad_token is the only name it
+            // needs; the unused slots hold the pad id.
+            Family::LetterReadout => {
+                let pad_id = special(&pad_token)?;
+                Layout {
+                    cls_id: pad_id,
+                    sep_id: pad_id,
+                    mask_id: pad_id,
+                    pad_id,
+                    max_len,
+                    head_max_len: max_len,
+                    mask_literal: pad_token.clone(),
+                    sep_literal: pad_token.clone(),
+                    seq_align: 1,
+                    fixed_classes: Vec::new(),
+                }
+            }
+            _ => {
+                let cls_token = name("cls_token")?;
+                let sep_token = name("sep_token")?;
+                let mask_token = name("mask_token")?;
+                Layout {
+                    cls_id: special(&cls_token)?,
+                    sep_id: special(&sep_token)?,
+                    mask_id: special(&mask_token)?,
+                    pad_id: special(&pad_token)?,
+                    max_len,
+                    head_max_len,
+                    mask_literal: mask_token,
+                    sep_literal: sep_token,
+                    seq_align: 1,
+                    fixed_classes: Vec::new(),
+                }
+            }
+        };
+        // seq_align: manifest-driven; 1 (no alignment) unless the family's
+        // graph requires a multiple.
+        let seq_align: usize = cfg
+            .get("seq_align")
+            .and_then(|v| v.as_u64())
+            .map_or(1, |v| v.max(1) as usize);
+        // fixed_shapes: static-S serving classes. Keys must be integer
+        // lengths -- a dropped key would silently narrow the served shapes.
+        let mut fixed_classes: Vec<usize> = match cfg.get("fixed_shapes") {
+            None => Vec::new(),
+            Some(v) => {
+                let obj = v.as_object().ok_or_else(|| {
+                    TokenizeError::Family(
+                        "model.json 'fixed_shapes' must map integer lengths to graph files".into(),
+                    )
+                })?;
+                let mut out = Vec::with_capacity(obj.len());
+                for key in obj.keys() {
+                    let len: usize = key.parse().map_err(|_| {
+                        TokenizeError::Family(format!(
+                            "fixed_shapes key {key:?} is not an integer length"
+                        ))
+                    })?;
+                    out.push(len);
+                }
+                out
+            }
+        };
+        fixed_classes.sort_unstable();
         let layout = Layout {
-            cls_id: special(&name("cls_token", DEFAULT_CLS_TOKEN))?,
-            sep_id: special(&name("sep_token", DEFAULT_SEP_TOKEN))?,
-            mask_id: special(&mask_token)?,
-            pad_id: special(&name("pad_token", DEFAULT_PAD_TOKEN))?,
-            max_len: num("max_len")?,
-            head_max_len: num("head_max_len")?,
-            mask_literal: mask_token,
+            seq_align,
+            fixed_classes,
+            ..layout
         };
-        Ok(Self { tok, layout })
+        let letter_table = match family {
+            Family::LetterReadout => derive_letter_table(&tok)?,
+            _ => Vec::new(),
+        };
+        // Read per family, not for everyone: only the independent-options
+        // recipe has a row builder that consults this, so a manifest that
+        // never mentions the key is the norm for the other two -- the field
+        // just stays false there.
+        let digit_split = match family {
+            Family::IndependentOptions => cfg
+                .get("digit_split")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            Family::MarkerHead | Family::LetterReadout => false,
+        };
+        Ok(Self {
+            tok,
+            layout,
+            family,
+            digit_split,
+            letter_table,
+        })
     }
 
-    fn encode_plain(&self, text: &str) -> Vec<u32> {
-        // add_special_tokens=false: [CLS]/[SEP] are added by this module,
-        // mirroring the official Python path.
+    /// Encode without special tokens; family recipes add structure tokens
+    /// themselves, mirroring the official Python paths.
+    pub(crate) fn encode_plain(&self, text: &str) -> Vec<u32> {
         self.tok
             .encode(text, false)
             .expect("tokenizer encode cannot fail on &str input")
@@ -149,33 +315,40 @@ impl TokenizerBundle {
             .to_vec()
     }
 
-    /// Option texts in marker order, re-typed from rl_common.render_options:
-    /// choice passes options through (crit values are None); score renders
-    /// "level %d: %s"; noul renders the two fixed sentences so `p[1] == P(true)`.
-    pub fn render_options(&self, task: &str, options: &[String]) -> Vec<String> {
-        match task {
-            "choice" => options.to_vec(),
-            "score" => options
-                .iter()
-                .enumerate()
-                .map(|(i, text)| format!("level {i}: {text}"))
-                .collect(),
-            // A caller-supplied 2-item pair (Jev criteria via /v1/systemone)
-            // replaces the default sentences; the native protocol passes none.
-            _ => {
-                if options.len() == 2 {
-                    options.to_vec()
-                } else {
-                    NOUL_DEFAULT_PAIR.map(|s| s.to_string()).to_vec()
-                }
+    /// Build EVERY engine row of one task request (official plan_rows): the
+    /// marker families render a single sequence; the letter-readout family
+    /// renders one row per isolated score level (choice/noul: one row).
+    pub fn build_sequences(
+        &self,
+        task: &str,
+        question: &str,
+        state: &str,
+        options: &[String],
+    ) -> Vec<BuiltSequence> {
+        match self.family {
+            Family::MarkerHead | Family::IndependentOptions => {
+                vec![self.build_sequence(task, question, state, options)]
+            }
+            Family::LetterReadout => {
+                crate::family::letter_readout::build_rows(self, task, question, state, options)
             }
         }
     }
 
-    /// Build the request sequence: `[CLS]` head `[SEP]` (`[MASK]` opt)k `[SEP]` state `[SEP]`,
-    /// with the full model-layer truncation semantics (48-cap, 192 shrink, 512 room).
-    /// `options` carries the option/level texts (choice/score); noul uses its
-    /// fixed pair unless the caller supplies two custom sentences (Jev criteria).
+    /// Option texts in marker order, per the model's family recipe.
+    pub fn render_options(&self, task: &str, options: &[String]) -> Vec<String> {
+        match self.family {
+            Family::MarkerHead => crate::family::marker_head::render_options(task, options),
+            Family::IndependentOptions => {
+                crate::family::independent_options::render_options(task, options)
+            }
+            Family::LetterReadout => crate::family::letter_readout::render_options(task, options),
+        }
+    }
+
+    /// Build the request sequence per the model's family recipe (single-row
+    /// form; see [`TokenizerBundle::build_sequences`] for the multi-row task
+    /// entry point the pipeline uses).
     pub fn build_sequence(
         &self,
         task: &str,
@@ -183,75 +356,24 @@ impl TokenizerBundle {
         state: &str,
         options: &[String],
     ) -> BuiltSequence {
-        let layout = &self.layout;
-        let ins = question.replace(&layout.mask_literal, " ");
-        let head_full = self.encode_plain(&format!("{task} question: {ins}"));
-
-        // Uncapped option encodings: `[MASK]` + " " + text (mask included in each).
-        let opt_full: Vec<Vec<u32>> = self
-            .render_options(task, options)
-            .iter()
-            .map(|opt| {
-                let mut ids = vec![layout.mask_id];
-                ids.extend(
-                    self.encode_plain(&format!(" {}", opt.replace(&layout.mask_literal, " "))),
+        match self.family {
+            Family::MarkerHead => {
+                crate::family::marker_head::build_sequence(self, task, question, state, options)
+            }
+            Family::IndependentOptions => crate::family::independent_options::build_sequence(
+                self, task, question, state, options,
+            ),
+            Family::LetterReadout => {
+                let rows =
+                    crate::family::letter_readout::build_rows(self, task, question, state, options);
+                // Loud, not silent: a letter score request is multi-row and
+                // must go through build_sequences (the pipeline's path).
+                assert!(
+                    rows.len() == 1,
+                    "letter score requests render one row per level; use build_sequences"
                 );
-                ids
-            })
-            .collect();
-        // Uncapped rendered length: `[CLS]` head `[SEP]` opts `[SEP]` state [SEP].
-        let mut full_len =
-            1 + head_full.len() + 1 + opt_full.iter().map(|o| o.len()).sum::<usize>() + 1;
-
-        // Per-option cap: the mask token is kept and at most OPT_TEXT_CAP text tokens
-        // follow it (rl_common line 60 caps the text, then prepends the mask -- the
-        // cap never eats the mask).
-        let mut opt_ids: Vec<Vec<u32>> = opt_full
-            .iter()
-            .map(|o| o[..(1 + OPT_TEXT_CAP).min(o.len())].to_vec())
-            .collect();
-        let mut opt_budget = layout
-            .head_max_len
-            .saturating_sub(opt_ids.iter().map(|o| o.len()).sum::<usize>());
-        if opt_budget < MIN_HEAD_BUDGET {
-            let per = ((layout.head_max_len - MIN_HEAD_BUDGET) / opt_ids.len().max(1))
-                .max(MIN_OPT_TOKENS);
-            opt_ids = opt_ids
-                .iter()
-                .map(|o| o[..per.min(o.len())].to_vec())
-                .collect();
-            opt_budget = layout
-                .head_max_len
-                .saturating_sub(opt_ids.iter().map(|o| o.len()).sum::<usize>());
-        }
-        let head_ids = &head_full[..head_full.len().min(opt_budget.max(8))];
-
-        let mut ids = Vec::with_capacity(layout.max_len);
-        ids.push(layout.cls_id);
-        ids.extend_from_slice(head_ids);
-        ids.push(layout.sep_id);
-        let mut markers = Vec::with_capacity(opt_ids.len());
-        for opt in &opt_ids {
-            markers.push(ids.len());
-            ids.extend_from_slice(opt);
-        }
-        ids.push(layout.sep_id);
-
-        let state_full = self.encode_plain(&state.replace(&layout.mask_literal, " "));
-        full_len += state_full.len() + 1;
-        // API path default: truncate_right (keep the head of the state).
-        let room = layout.max_len.saturating_sub(ids.len() + 1);
-        ids.extend_from_slice(&state_full[..state_full.len().min(room)]);
-        ids.push(layout.sep_id);
-        ids.truncate(layout.max_len);
-
-        BuiltSequence {
-            markers: markers
-                .into_iter()
-                .filter(|m| *m < layout.max_len)
-                .collect(),
-            ids,
-            full_len,
+                rows.into_iter().next().expect("checked len above")
+            }
         }
     }
 }

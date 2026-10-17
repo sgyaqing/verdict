@@ -22,7 +22,7 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// options/levels upper bound (protocol contract).
 pub const MAX_OPTIONS: usize = 32;
 /// options/levels lower bound: k=1 crashes the official forward (topk(2) on
-/// a K=1 axis); bug-for-bug, Verdict rejects what the reference cannot run.
+/// a K=1 axis); Verdict rejects what the reference cannot run.
 pub const MIN_OPTIONS: usize = 2;
 
 // ---------------------------------------------------------------- requests
@@ -271,7 +271,7 @@ async fn health(State(pipeline): State<Arc<Pool>>) -> Response {
     if pipeline.health() {
         Json(json!({"status": "ok", "version": env!("CARGO_PKG_VERSION")})).into_response()
     } else {
-        // Real liveness probe (TEI Infer::health pattern): an unhealthy engine
+        // Real liveness probe: an unhealthy engine
         // answers 503, not a static "ok".
         (
             StatusCode::SERVICE_UNAVAILABLE,

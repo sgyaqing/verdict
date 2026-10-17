@@ -1,5 +1,4 @@
-# Verdict CI: format and lint. The test suites and the data they read are not
-# published, so there is no test step here.
+# Verdict CI: the commands live in ci/check.sh (format + lint).
 
 name: ci
 
@@ -17,7 +16,5 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Format
-        run: cargo fmt --check
-      - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Check
+        run: ci/check.sh

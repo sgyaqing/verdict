@@ -21,7 +21,10 @@ fn main() -> ExitCode {
 
     // Model spec -> local dir, downloading HF repo ids into the cache
     // (blocking startup work, same single-threaded-phase rule as the engine).
-    match verdict::model_source::resolve(&cfg.model_dir.to_string_lossy()) {
+    match verdict::model_source::resolve_forced(
+        &cfg.model_dir.to_string_lossy(),
+        cfg.force_download,
+    ) {
         Ok(dir) => cfg.model_dir = dir,
         Err(err) => {
             eprintln!("error: {err}");
@@ -42,7 +45,7 @@ fn main() -> ExitCode {
     // no blocking calls on async contexts). One engine per data-parallel
     // replica. With N > 1 the intra-op thread budget is PARTITIONED (cores/N
     // per replica): N default pools oversubscribe the cores N-fold and
-    // throughput falls with N (measured).
+    // throughput falls with N.
     let intra_threads = if cfg.data_parallel > 1 {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -96,6 +99,62 @@ fn build_engine(
     replica: usize,
     intra_threads: usize,
 ) -> Result<Arc<dyn Engine>, String> {
+    // The manifest, not the CLI, picks the runtime: a `"runtime": "torch"`
+    // package serves through the torch executor regardless of `--engine`
+    // (the executor IS an engine choice the packager made) -- the explicit
+    // `--engine stub` escape hatch aside.
+    // Read cheaply and loudly: a broken manifest must fail here, not at the
+    // first request.
+    let manifest = std::fs::read_to_string(cfg.model_dir.join("model.json")).map_err(|err| {
+        format!(
+            "failed to read {}: {err}",
+            cfg.model_dir.join("model.json").display()
+        )
+    })?;
+    let manifest: serde_json::Value =
+        serde_json::from_str(&manifest).map_err(|err| format!("invalid model.json: {err}"))?;
+    // Required, not defaulted: a misspelled runtime must not silently select
+    // the other path and fail with a misleading error.
+    let runtime = match manifest.get("runtime").and_then(|v| v.as_str()) {
+        Some(r @ ("ort" | "torch")) => r,
+        Some(other) => {
+            return Err(format!(
+                "model.json declares unknown runtime {other:?} (this build knows: \"ort\", \"torch\")"
+            ));
+        }
+        None => {
+            return Err(
+                "model.json is missing the 'runtime' field (\"ort\" or \"torch\")".to_string(),
+            );
+        }
+    };
+    if runtime == "torch" {
+        if cfg.engine == EngineChoice::Stub {
+            // The stub stays an explicit escape hatch for tokenization-only
+            // runs even on torch packages.
+            if replica == 0 {
+                tracing::warn!(
+                    "--engine stub: serving deterministic pseudo-scores, NOT real inference"
+                );
+            }
+            return Ok(Arc::new(StubEngine::new(std::time::Duration::ZERO)));
+        }
+        if cfg.device == Device::Cpu {
+            return Err(
+                "this package declares runtime \"torch\", which serves on CUDA only in v0.2 \
+                 (the executor loads the checkpoint in bf16 on the GPU); use --device cuda or auto"
+                    .to_string(),
+            );
+        }
+        if replica == 0 {
+            tracing::info!(
+                "runtime \"torch\": serving through the python torch executor (bf16, CUDA)"
+            );
+        }
+        let engine = verdict::torch_engine::TorchEngine::new(&cfg.model_dir)
+            .map_err(|verdict::engine::EngineError(msg)| msg)?;
+        return Ok(Arc::new(engine));
+    }
     match (cfg.engine, cfg.device) {
         (EngineChoice::Stub, _) => {
             if replica == 0 {
@@ -150,17 +209,46 @@ fn build_engine(
                     suggested_data_parallel = suggested,
                     "many-core CPU host with --data-parallel 1; on hosts like this \
                      --data-parallel ~cores/24 typically serves several times more \
-                     requests/s (4.4x measured on a 96-core Xeon) -- sweep N \
-                     to tune"
+                     requests/s -- sweep N to tune"
                 );
             }
-            let engine = OrtEngine::with_device_and_threads(&cfg.model_dir, kind, intra_threads)
-                .map_err(|EngineError(msg)| msg)?;
+            // Loading a 1.5 GB graph takes a minute or two, and nothing else is
+            // printed until it finishes: say so, or a first start looks hung.
+            let load_started = std::time::Instant::now();
             tracing::info!(
                 replica,
-                requested = ?device,
-                registered_ep = ?kind,
                 model = %cfg.model_dir.display(),
+                device = %kind.name(),
+                "loading the model graph (a minute or two on first start; the next line comes when it is ready)"
+            );
+            let engine =
+                match OrtEngine::with_device_and_threads(&cfg.model_dir, kind, intra_threads) {
+                    Ok(engine) => engine,
+                    // `auto` keeps its contract (probe CUDA, else CPU): a CUDA
+                    // registration failure downgrades LOUDLY to CPU. An explicit
+                    // `--device cuda` fails hard instead -- silent CPU placement
+                    // is worse than an error.
+                    Err(EngineError(msg))
+                        if device == Device::Auto && kind == verdict::engine::DeviceKind::Cuda =>
+                    {
+                        tracing::warn!(
+                            "--device auto: CUDA registration failed ({msg}); serving on CPU"
+                        );
+                        OrtEngine::with_device_and_threads(
+                            &cfg.model_dir,
+                            verdict::engine::DeviceKind::Cpu,
+                            intra_threads,
+                        )
+                        .map_err(|EngineError(msg)| msg)?
+                    }
+                    Err(EngineError(msg)) => return Err(msg),
+                };
+            tracing::info!(
+                replica,
+                requested = %device.name(),
+                registered_ep = %kind.name(),
+                model = %cfg.model_dir.display(),
+                secs = load_started.elapsed().as_secs(),
                 "OrtEngine ready (fp32, TF32 off on CUDA)"
             );
             if kind == verdict::engine::DeviceKind::Cuda {

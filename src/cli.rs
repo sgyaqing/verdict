@@ -16,7 +16,7 @@
 //!   --data-parallel `<N>`        engine replicas, each with its own session,
 //!                              queue, and batcher (default 1). On many-core
 //!                              x86 CPU hosts, concurrent replicas outperform
-//!                              one big session.
+//!                              one big session (see the README's tuning section).
 //!   --policy <fcfs|priority>    admission policy (default fcfs; priority =
 //!                              lower request priority admitted first)
 //!   --served-model-name <NAME>  id advertised on /v1/models and chat
@@ -37,6 +37,17 @@ pub enum Device {
     Cuda,
 }
 
+impl Device {
+    /// The spelling the CLI flag accepts, so logs and flags agree.
+    pub fn name(self) -> &'static str {
+        match self {
+            Device::Auto => "auto",
+            Device::Cpu => "cpu",
+            Device::Cuda => "cuda",
+        }
+    }
+}
+
 /// Batch admission policy. FCFS is the default; `priority`
 /// orders the queue by the request's `priority` field, smaller first
 /// (vLLM `policy=priority` semantics).
@@ -49,6 +60,10 @@ pub enum PolicyChoice {
 #[derive(Debug, Clone)]
 pub struct ServeConfig {
     pub model_dir: PathBuf,
+    /// `--force-download`: re-fetch the package instead of serving a cached
+    /// copy. The cache is trusted by default (upstream packages are released
+    /// artifacts), which is why this exists for the times they are not.
+    pub force_download: bool,
     pub host: String,
     pub port: u16,
     pub engine: EngineChoice,
@@ -72,6 +87,7 @@ impl Default for ServeConfig {
     fn default() -> Self {
         Self {
             model_dir: PathBuf::new(),
+            force_download: false,
             served_model_name: None,
             policy: PolicyChoice::Fcfs,
             data_parallel: 1,
@@ -102,6 +118,8 @@ Flags:
   --host ADDR               listen address (default 127.0.0.1)
   --port PORT               listen port (default 8080)
   --engine ort|stub         inference engine (default ort; stub = pseudo-scores)
+  --force-download          re-fetch the model package instead of using the
+                            cached copy (default: the cache is trusted)
   --device auto|cpu|cuda    execution device (default auto: probe CUDA, else CPU)
   --max-batch-size N        scheduler batch cap (default 32)
   --batch-window-ms MS      batching window after the first arrival (default 5)
@@ -113,9 +131,10 @@ Flags:
                             N>1 serves far more requests/s -- see README)
 
 Environment:
-  HF_ENDPOINT               hub mirror (e.g. https://hf-mirror.com)
+  HF_ENDPOINT               alternate hub endpoint (mirror)
   HF_TOKEN / MODELSCOPE_API_TOKEN   gated-repo auth
   VERDICT_USE_MODELSCOPE=1  resolve repo ids against ModelScope
+  VERDICT_CACHE             where downloaded packages land (default $XDG_CACHE_HOME/verdict)
   ORT_DYLIB_PATH            onnxruntime library (else model lib/ or beside the binary)
 ";
 
@@ -139,7 +158,7 @@ pub fn handled_special(args: &[String]) -> bool {
 const USAGE: &str = "usage: verdict serve <MODEL_DIR> [--host ADDR] [--port PORT] \
 [--engine ort|stub] [--device auto|cpu|cuda] [--max-batch-size N] [--batch-window-ms MS] \
 [--max-input-tokens N] [--queue-cap N] [--served-model-name NAME] [--policy fcfs|priority] \
-[--data-parallel N]";
+[--data-parallel N] [--force-download]";
 
 /// Parse `verdict serve ...` arguments. Returns Err(message) on any misuse.
 pub fn parse_args(args: &[String]) -> Result<ServeConfig, String> {
@@ -156,6 +175,7 @@ pub fn parse_args(args: &[String]) -> Result<ServeConfig, String> {
                 .ok_or_else(|| format!("{flag} requires a value\n{USAGE}"))
         };
         match arg.as_str() {
+            "--force-download" => cfg.force_download = true,
             "--host" => cfg.host = take_value("--host")?,
             "--port" => cfg.port = parse::<u16>("--port", &take_value("--port")?)?,
             "--served-model-name" => {
