@@ -1,6 +1,12 @@
 # Whitelist: the build consumes exactly these paths; everything else stays
 # out of the context no matter what the local tree holds.
+#
+# `executor/torch_exec.py` is here because `src/torch_engine.rs` embeds it with
+# `include_str!`: the python executor must exist at COMPILE time even for the
+# CPU image, which never runs it. Dropping it from the context fails the build.
 *
 !Cargo.toml
 !Cargo.lock
 !src
+!executor
+!docker/cc1_build.sh

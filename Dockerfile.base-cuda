@@ -1,0 +1,144 @@
+# Verdict CUDA base image: runtime dependencies, carved from the published
+# 0.2.0-cuda image (the donor). Release images (Dockerfile.cuda) add only the
+# binary layer. When the dependency pins change, build a fresh donor with
+# Dockerfile.build.cuda first, then rebuild this and bump the tag.
+#
+# Build:
+#   docker buildx build -f Dockerfile.base-cuda --platform linux/amd64 \
+#     -t sgyaqing/verdict:base-0.2-cuda --load .
+
+# Layers stay under ~1 GB so a failed push loses one chunk. Do not merge the
+# chunk instructions.
+FROM sgyaqing/verdict:0.2.0-cuda AS donor
+
+FROM python:3.12-slim-trixie
+
+# The C toolchain is a runtime dependency (triton JITs kernels on first use);
+# gcc is not enough -- C headers live in libc6-dev via build-essential.
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+        [ -f "$f" ] && sed -i "s|deb.debian.org|$APT_MIRROR|g" "$f"; \
+      done; \
+    fi
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgomp1 build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+WORKDIR /app
+
+# libonnxruntime.so / .so.1 are symlinks in the donor; copying them collides
+# with the ln -s below. Copy the real file, recreate the links.
+COPY --from=donor /usr/local/lib/libonnxruntime.so.1.30.0 \
+                    /usr/local/lib/libonnxruntime_providers_cuda.so \
+                    /usr/local/lib/libonnxruntime_providers_shared.so \
+                    /usr/local/lib/libonnxruntime_providers_tensorrt.so \
+                    /usr/local/lib/
+RUN ln -s libonnxruntime.so.1.30.0 /usr/local/lib/libonnxruntime.so \
+    && ln -s libonnxruntime.so.1.30.0 /usr/local/lib/libonnxruntime.so.1 \
+    && ldconfig
+
+# ~580 MB
+COPY --from=donor /usr/local/lib/libcublasLt.so.13 \
+                    /usr/local/lib/libcublas.so.13 \
+                    /usr/local/lib/libcudart.so.13 \
+                    /usr/local/lib/libnvblas.so.13 \
+                    /usr/local/lib/
+# ~890 MB
+COPY --from=donor /usr/local/lib/libcudnn.so.9 \
+                    /usr/local/lib/libcudnn_adv.so.9 \
+                    /usr/local/lib/libcudnn_cnn.so.9 \
+                    /usr/local/lib/libcudnn_engines_precompiled.so.9 \
+                    /usr/local/lib/libcudnn_engines_runtime_compiled.so.9 \
+                    /usr/local/lib/libcudnn_engines_tensor_ir.so.9 \
+                    /usr/local/lib/libcudnn_ext.so.9 \
+                    /usr/local/lib/libcudnn_graph.so.9 \
+                    /usr/local/lib/libcudnn_heuristic.so.9 \
+                    /usr/local/lib/libcudnn_ops.so.9 \
+                    /usr/local/lib/
+# ~480 MB
+COPY --from=donor /usr/local/lib/libcufft.so.12 \
+                    /usr/local/lib/libcufftw.so.12 \
+                    /usr/local/lib/libcurand.so.10 \
+                    /usr/local/lib/libnvrtc.so.13 \
+                    /usr/local/lib/libnvrtc-builtins.so.13.4 \
+                    /usr/local/lib/
+RUN ldconfig
+
+# Directory chunks use cp -a under a bind mount: COPY of a directory merges
+# its contents into the destination and drops the directory name.
+# ~900 MB
+COPY --from=donor /usr/local/lib/python3.12/site-packages/nvidia/cu13/lib/libcublasLt.so.13 \
+                    /usr/local/lib/python3.12/site-packages/nvidia/cu13/lib/libcublas.so.13 \
+                    /usr/local/lib/python3.12/site-packages/nvidia/cu13/lib/libcufft.so.12 \
+                    /usr/local/lib/python3.12/site-packages/nvidia/cu13/lib/
+# ~880 MB; the find exclusions mirror the COPY above -- keep both in sync or a
+# renamed library is silently dropped.
+RUN --mount=type=bind,from=donor,source=/usr/local/lib/python3.12/site-packages/nvidia/cu13,target=/donor_cu13 \
+    cd /usr/local/lib/python3.12/site-packages/nvidia && mkdir -p cu13 && cd cu13 \
+    && find /donor_cu13 -mindepth 1 -maxdepth 1 ! -name lib -exec cp -a {} . \; \
+    && mkdir -p lib && cd lib \
+    && find /donor_cu13/lib -mindepth 1 -maxdepth 1 \
+        ! -name 'libcublasLt.so.13' ! -name 'libcublas.so.13' \
+        ! -name 'libcufft.so.12' \
+        -exec cp -a {} . \;
+
+# ~920 MB, alone: with the trio below the layer passes 1 GB.
+RUN --mount=type=bind,from=donor,source=/usr/local/lib/python3.12/site-packages/nvidia,target=/donor_nv \
+    cd /usr/local/lib/python3.12/site-packages/nvidia \
+    && cp -a /donor_nv/cudnn .
+# ~570 MB
+RUN --mount=type=bind,from=donor,source=/usr/local/lib/python3.12/site-packages/nvidia,target=/donor_nv \
+    cd /usr/local/lib/python3.12/site-packages/nvidia \
+    && cp -a /donor_nv/cusparselt /donor_nv/nvshmem /donor_nv/nccl .
+
+# The two giant .so files are ~900 MB together; one file cannot span layers.
+COPY --from=donor /usr/local/lib/python3.12/site-packages/torch/lib/libtorch_cuda.so \
+                    /usr/local/lib/python3.12/site-packages/torch/lib/libtorch_cpu.so \
+                    /usr/local/lib/python3.12/site-packages/torch/lib/
+# ~280 MB
+RUN --mount=type=bind,from=donor,source=/usr/local/lib/python3.12/site-packages/torch,target=/donor_torch \
+    cd /usr/local/lib/python3.12/site-packages/torch \
+    && find /donor_torch -mindepth 1 -maxdepth 1 ! -name lib -exec cp -a {} . \; \
+    && mkdir -p lib && cd lib \
+    && find /donor_torch/lib -mindepth 1 -maxdepth 1 \
+        ! -name 'libtorch_cuda.so' ! -name 'libtorch_cpu.so' \
+        -exec cp -a {} . \;
+
+# ~935 MB
+RUN --mount=type=bind,from=donor,source=/usr/local/lib/python3.12/site-packages,target=/donor_sp \
+    cd /usr/local/lib/python3.12/site-packages \
+    && cp -a /donor_sp/triton .
+
+# ~570 MB. The kernel .so is not importable without the causal_conv1d/ wrapper
+# dir and the dist-info.
+RUN --mount=type=bind,from=donor,source=/usr/local/lib/python3.12/site-packages,target=/donor_sp \
+    cd /usr/local/lib/python3.12/site-packages \
+    && cp -a /donor_sp/causal_conv1d \
+              /donor_sp/causal_conv1d-1.7.0.dist-info \
+              /donor_sp/causal_conv1d_cuda.cpython-312-x86_64-linux-gnu.so \
+              /donor_sp/transformers \
+              /donor_sp/sympy \
+              /donor_sp/numpy \
+              /donor_sp/numpy.libs \
+              /donor_sp/cuda \
+              .
+
+# ~130 MB; the exclusions mirror every chunk above. After each rebuild, diff
+# the full file listings of base and donor -- equal counts or sizes do not
+# prove the tree is right.
+RUN --mount=type=bind,from=donor,source=/usr/local/lib/python3.12/site-packages,target=/donor_sp \
+    cd /usr/local/lib/python3.12/site-packages \
+    && find /donor_sp -mindepth 1 -maxdepth 1 \
+        ! -name nvidia ! -name torch ! -name triton \
+        ! -name 'causal_conv1d*' ! -name transformers ! -name sympy \
+        ! -name numpy ! -name numpy.libs ! -name cuda \
+        -exec cp -a {} . \;
+
+VOLUME /model
+EXPOSE 8080
+ENTRYPOINT ["verdict"]
+CMD ["serve", "/model", "--host", "0.0.0.0", "--port", "8080"]

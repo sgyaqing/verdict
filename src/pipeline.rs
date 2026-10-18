@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
-use crate::calibration::{Calibrated, CalibrationConfig, calibrate};
+use crate::calibration::{CalibCtx, Calibrated, CalibrationConfig, calibrate};
 use crate::engine::Engine;
 use crate::protocol::{
     ApiError, ChoiceRequest, ChoiceResponse, NoulRequest, NoulResponse, ScoreRequest,
@@ -51,9 +51,15 @@ impl Pipeline {
         &self.served_model
     }
 
-    /// Liveness surfaced through /health (TEI Infer::health pattern).
+    /// Liveness surfaced through /health: a real probe, not a static "ok".
     pub fn health(&self) -> bool {
         self.engine.health()
+    }
+
+    /// Which family recipe this pipeline serves (protocol adapters compose
+    /// per-family request shapes).
+    pub fn family(&self) -> crate::family::Family {
+        self.bundle.family
     }
 
     #[tracing::instrument(skip_all, fields(task = "choice"))]
@@ -127,8 +133,82 @@ impl Pipeline {
         options: &[String],
         priority: i64,
     ) -> Result<(Calibrated, u64), ApiError> {
+        match self.bundle.family {
+            crate::family::Family::LetterReadout => {
+                self.run_task_letter(task, question, state, options, priority)
+                    .await
+            }
+            _ => {
+                self.run_task_marker(task, question, state, options, priority)
+                    .await
+            }
+        }
+    }
+
+    /// The letter-readout task path: a request renders ONE OR MORE rows (a
+    /// score question runs one isolated yes/no row per level), every row is
+    /// its own scheduler submission so the batcher packs them together, and
+    /// usage counts the shared state prefix once (official unique_tokens --
+    /// for a single-question request this is exactly the official number).
+    async fn run_task_letter(
+        &self,
+        task: &str,
+        question: &str,
+        state: &str,
+        options: &[String],
+        priority: i64,
+    ) -> Result<(Calibrated, u64), ApiError> {
+        let rows = self.bundle.build_sequences(task, question, state, options);
+        for row in &rows {
+            if row.full_len > self.max_input_tokens {
+                return Err(ApiError::InvalidRequest(format!(
+                    "rendered prompt is {} tokens, exceeding --max-input-tokens {} \
+                     (note: model-layer truncation at {} does not exempt a request from this budget)",
+                    row.full_len, self.max_input_tokens, self.bundle.layout.max_len
+                )));
+            }
+        }
+        let input_tokens = crate::family::letter_readout::unique_tokens(
+            &rows.iter().map(|r| r.ids.as_slice()).collect::<Vec<_>>(),
+        );
+        // Submit every row before awaiting: they land in the queue together
+        // and the batcher forms one batch (subject to the token budget).
+        let mut rxs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let rx = self
+                .scheduler
+                .submit(task, row, priority)
+                .map_err(map_scheduler_error)?;
+            rxs.push(rx);
+        }
+        let mut logits = Vec::new();
+        for rx in rxs {
+            let row = rx
+                .await
+                .map_err(|_| ApiError::Internal("scheduler dropped the responder".into()))?
+                .map_err(map_scheduler_error)?;
+            logits.extend(row);
+        }
+        let ctx = CalibCtx { state_tokens: 0 };
+        Ok((
+            calibrate(task, &logits, &ctx, &self.calibration),
+            input_tokens,
+        ))
+    }
+
+    /// The marker-family task path (single row + the independent-options
+    /// zero-shot noul debias pass).
+    async fn run_task_marker(
+        &self,
+        task: &str,
+        question: &str,
+        state: &str,
+        options: &[String],
+        priority: i64,
+    ) -> Result<(Calibrated, u64), ApiError> {
         let built = self.bundle.build_sequence(task, question, state, options);
-        let input_tokens = built.full_len as u64;
+        let mut input_tokens = built.full_len as u64;
+        let state_tokens = built.state_tokens;
         if input_tokens > self.max_input_tokens as u64 {
             return Err(ApiError::InvalidRequest(format!(
                 "rendered prompt is {input_tokens} tokens, exceeding --max-input-tokens {} \
@@ -136,15 +216,69 @@ impl Pipeline {
                 self.max_input_tokens, self.bundle.layout.max_len
             )));
         }
+        // Zero-shot noul on the independent-options family: the official
+        // path runs a SECOND context-free forward and shifts the true-side
+        // logit by a fitted prior before calibration (usage counts both
+        // passes). Options empty == no caller criteria == zero-shot.
+        let prior = self.calibration.noul_prior();
+        let null_built = match (task, prior) {
+            ("noul", Some(prior)) if options.is_empty() => Some((
+                self.bundle.build_sequence(task, question, "", options),
+                prior,
+            )),
+            _ => None,
+        };
         let rx = self
             .scheduler
             .submit(task, built, priority)
             .map_err(map_scheduler_error)?;
+        let null_rx = match &null_built {
+            Some((null, _)) => Some(
+                self.scheduler
+                    .submit(task, null.clone(), priority)
+                    .map_err(map_scheduler_error)?,
+            ),
+            None => None,
+        };
         let logits = rx
             .await
             .map_err(|_| ApiError::Internal("scheduler dropped the responder".into()))?
             .map_err(map_scheduler_error)?;
-        Ok((calibrate(task, &logits, &self.calibration), input_tokens))
+        let logits = match (null_rx, null_built) {
+            (Some(null_rx), Some((null, prior))) => {
+                let null_logits = null_rx
+                    .await
+                    .map_err(|_| ApiError::Internal("scheduler dropped the responder".into()))?
+                    .map_err(map_scheduler_error)?;
+                input_tokens += null.full_len as u64;
+                let bias = null_logits[0] - null_logits[1];
+                vec![logits[0] - (prior.a * bias + prior.b), logits[1]]
+            }
+            _ => logits,
+        };
+        let ctx = CalibCtx { state_tokens };
+        Ok((
+            calibrate(task, &logits, &ctx, &self.calibration),
+            input_tokens,
+        ))
+    }
+
+    /// The engine rows a task request would render (no submission): the
+    /// request-level usage seam for multi-question surfaces on the
+    /// letter-readout family, whose usage counts the shared state prefix
+    /// once across ALL questions of one request, not once per question.
+    pub fn build_row_ids(
+        &self,
+        task: &str,
+        question: &str,
+        state: &str,
+        options: &[String],
+    ) -> Vec<Vec<u32>> {
+        self.bundle
+            .build_sequences(task, question, state, options)
+            .into_iter()
+            .map(|row| row.ids)
+            .collect()
     }
 
     /// Graceful shutdown: close intake, drain, join (called AFTER the HTTP
@@ -273,6 +407,23 @@ impl Pool {
     /// Model id advertised on the compat surface (identical across replicas).
     pub fn served_model(&self) -> &str {
         self.replicas[0].served_model()
+    }
+
+    /// The engine rows a task request would render, via the first replica's
+    /// tokenizer (identical across replicas; no submission, no engine work).
+    pub fn build_row_ids(
+        &self,
+        task: &str,
+        question: &str,
+        state: &str,
+        options: &[String],
+    ) -> Vec<Vec<u32>> {
+        self.replicas[0].build_row_ids(task, question, state, options)
+    }
+
+    /// Which family recipe the pool serves (identical across replicas).
+    pub fn family(&self) -> crate::family::Family {
+        self.replicas[0].family()
     }
 
     /// Liveness: healthy only when EVERY replica's engine is (a degraded

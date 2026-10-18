@@ -5,14 +5,20 @@
 //! habit.
 //!
 //! Backends: the Hugging Face Hub (default; `HF_ENDPOINT` switches to a
-//! mirror such as https://hf-mirror.com, `HF_TOKEN` authenticates gated
+//! mirror endpoint, `HF_TOKEN` authenticates gated
 //! repos) and ModelScope (`VERDICT_USE_MODELSCOPE=1`;
 //! `MODELSCOPE_API_TOKEN` for auth). Both hubs download through one shared
 //! stall-guarded downloader (per-read timeout, bounded retries, atomic
-//! `<file>.part` -> rename); the hf-hub crate is used only to READ an
-//! existing standard HF cache, never to fetch. Verdict never converts
-//! models (verdict-ready repos are produced offline, GGUF-style), so the
-//! hub side is download-only.
+//! `<file>.part` -> rename). Verdict never converts models (verdict-ready
+//! repos are produced offline, GGUF-style), so the hub side is download-only.
+//!
+//! What differs between the hubs is URL shape, default branch name and auth
+//! variable -- nothing about what a package IS. All of it lives in [`Hub`],
+//! and the package fetch is written once against it, so a repo of the same
+//! name behaves the same on either hub. Both cache to `<cache>/<org>/<name>`
+//! (`$VERDICT_CACHE` overrides the root) -- one directory per model, not per
+//! hub -- and neither consults the hub's own cache: the hubs hold upstream
+//! repos, whose layout is not ours.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -35,6 +41,189 @@ impl HubBackend {
     }
 }
 
+/// Everything the two hubs do differently, in one place: URL shape, default
+/// branch name, auth variable, cache layout, and how a missing file reports
+/// itself. The package fetch is written ONCE against this. A per-backend
+/// split drifts: one hub silently ends up without a package shape the other
+/// supports.
+#[derive(Debug, Clone)]
+pub struct Hub {
+    backend: HubBackend,
+    /// Base URL, no trailing slash. For ModelScope the `/models` prefix is
+    /// part of the base, not of the file path.
+    endpoint: String,
+    bearer: Option<String>,
+    /// `--force-download`: re-fetch every file and ignore the completion
+    /// marker, so an updated or name-colliding upstream package is picked up.
+    /// Named after `huggingface_hub`'s `force_download`, which transformers and
+    /// vLLM carry too; ModelScope spells the same thing `--force`.
+    force: bool,
+}
+
+impl Hub {
+    pub fn for_backend(backend: HubBackend) -> Self {
+        match backend {
+            HubBackend::Hf => {
+                // HF_ENDPOINT switches the whole path to a mirror
+                // (a mirror endpoint); HF_TOKEN authenticates gated repos.
+                let endpoint = std::env::var("HF_ENDPOINT")
+                    .ok()
+                    .map(|e| e.trim_end_matches('/').to_owned())
+                    .unwrap_or_else(|| "https://huggingface.co".to_owned());
+                Hub {
+                    backend,
+                    endpoint,
+                    bearer: std::env::var("HF_TOKEN").ok(),
+                    force: false,
+                }
+            }
+            HubBackend::ModelScope => Hub {
+                backend,
+                endpoint: "https://modelscope.cn/models".to_owned(),
+                bearer: std::env::var("MODELSCOPE_API_TOKEN").ok(),
+                force: false,
+            },
+        }
+    }
+
+    /// An explicitly addressed hub, for a caller the environment does not
+    /// name -- tests point this at a throwaway local server.
+    pub fn with_endpoint(
+        backend: HubBackend,
+        endpoint: impl Into<String>,
+        bearer: Option<String>,
+    ) -> Self {
+        Hub {
+            backend,
+            endpoint: endpoint.into().trim_end_matches('/').to_owned(),
+            bearer,
+            force: false,
+        }
+    }
+
+    /// `--force-download`.
+    pub fn forced(mut self, on: bool) -> Self {
+        self.force = on;
+        self
+    }
+
+    pub fn backend(&self) -> HubBackend {
+        self.backend
+    }
+
+    /// The branch a file resolves to when the manifest pins no revision. The
+    /// two hubs name their default branch differently, which is why the pin
+    /// is optional: one manifest has to serve both.
+    pub fn default_branch(&self) -> &'static str {
+        match self.backend {
+            HubBackend::Hf => "main",
+            HubBackend::ModelScope => "master",
+        }
+    }
+
+    /// The name to use in a message the user reads.
+    fn display(&self) -> &'static str {
+        match self.backend {
+            HubBackend::Hf => "Hugging Face",
+            HubBackend::ModelScope => "ModelScope",
+        }
+    }
+
+    /// The name to use in a log field.
+    fn slug(&self) -> &'static str {
+        match self.backend {
+            HubBackend::Hf => "huggingface",
+            HubBackend::ModelScope => "modelscope",
+        }
+    }
+
+    /// What to add when the manifest itself could not be fetched -- the two
+    /// hubs fail for different reasons and the fix differs.
+    fn manifest_hint(&self) -> &'static str {
+        match self.backend {
+            HubBackend::Hf => "is this a verdict-ready repo? see the README model section",
+            HubBackend::ModelScope => "is this repo verdict-ready AND hosted on ModelScope?",
+        }
+    }
+
+    /// What to add when the official weights could not be fetched.
+    ///
+    /// The manifest names the checkpoint as it is on HUGGING FACE; on
+    /// ModelScope the same id is asked for. Vendors do not always mirror their
+    /// repo there under that name, and when they do not, nothing on our side
+    /// can fix it -- so the message has to tell the user which repo is being
+    /// looked for where, and what to do instead. Reporting it to the package
+    /// maintainer would be the wrong advice for that case.
+    fn checkpoint_hint(&self, repo: &str) -> String {
+        match self.backend {
+            HubBackend::Hf => format!(
+                "the checkpoint lives in the official repo {repo}, not in this package; \
+                 a missing file means it moved upstream -- report it to the package maintainer"
+            ),
+            HubBackend::ModelScope => format!(
+                "these weights come from the official repo {repo}, which may not be mirrored \
+                 on ModelScope under that name; serve it from Hugging Face instead \
+                 (drop VERDICT_USE_MODELSCOPE, and set HF_ENDPOINT if you fetch \
+                 through a mirror)"
+            ),
+        }
+    }
+
+    fn file_url(&self, repo_id: &str, revision: &str, path: &str) -> String {
+        format!("{}/{repo_id}/resolve/{revision}/{path}", self.endpoint)
+    }
+
+    /// Where this repo's files land: `<cache>/<org>/<name>`.
+    ///
+    /// Keyed by repo id alone, NOT by hub: the two hubs are held to the same
+    /// content (an operational rule, not an assumption this code can check), so
+    /// the same repo id names one artifact however it is fetched. A repo that
+    /// exists on only one hub is unaffected either way.
+    fn cache_dir(&self, repo_id: &str) -> PathBuf {
+        // The model NAME, not the repo id: the two hubs are held to the same
+        // content (an operational rule), so `verdict-models/von` on one and
+        // `sgyaqing/von` on the other are one artifact and must share a slot.
+        // Two DIFFERENT repos that happen to share a name would collide -- a
+        // refresh/override flag is the escape hatch, and is not built yet.
+        let (_, name) = repo_id
+            .split_once('/')
+            .expect("is_repo_id guarantees one slash");
+        verdict_cache_root().join(name)
+    }
+
+    /// Cache-first fetch of one file through the shared stall-guarded
+    /// downloader. An already-present file is a hit and touches no network.
+    pub fn get(
+        &self,
+        repo_id: &str,
+        revision: &str,
+        path: &str,
+        dir: &Path,
+    ) -> Result<PathBuf, String> {
+        let dest = dir.join(path);
+        if dest.is_file() && !self.force {
+            return Ok(dest);
+        }
+        let url = self.file_url(repo_id, revision, path);
+        match http_download_auth(&url, &dest, self.bearer.as_deref()) {
+            Ok(()) => Ok(dest),
+            // ModelScope answers a missing file with HTTP 500, not 404.
+            // 500 stays retryable at the http_download
+            // layer; here a 500 that survived every retry is "absent".
+            Err(err) if self.backend == HubBackend::ModelScope && err.contains("HTTP 500") => {
+                Err(format!(
+                    "fetching {path} from {repo_id} on ModelScope: {err} \
+                     (ModelScope reports 500 for missing files -- likely absent)"
+                ))
+            }
+            Err(err) => Err(format!(
+                "fetching {path} from {repo_id} on {}: {err}",
+                self.display()
+            )),
+        }
+    }
+}
+
 /// Does this look like a repo id (`<namespace>/<name>`) rather than a path?
 pub fn is_repo_id(spec: &str) -> bool {
     !spec.is_empty()
@@ -53,17 +242,25 @@ pub fn resolve(spec: &str) -> Result<PathBuf, String> {
     resolve_backend(spec, HubBackend::from_env())
 }
 
+/// `verdict serve --force-download`: same as [`resolve`], but every file is
+/// re-fetched and the completion marker is ignored, so a package that changed
+/// upstream -- or one sharing its name with a different repo -- is picked up.
+pub fn resolve_forced(spec: &str, force: bool) -> Result<PathBuf, String> {
+    resolve_with(spec, HubBackend::from_env(), force)
+}
+
 /// Backend-explicit resolve (tests pass the backend directly).
 pub fn resolve_backend(spec: &str, backend: HubBackend) -> Result<PathBuf, String> {
+    resolve_with(spec, backend, false)
+}
+
+fn resolve_with(spec: &str, backend: HubBackend, force: bool) -> Result<PathBuf, String> {
     let local = Path::new(spec);
     if local.is_dir() {
         return Ok(local.to_path_buf());
     }
     if is_repo_id(spec) {
-        return match backend {
-            HubBackend::Hf => download_hf(spec),
-            HubBackend::ModelScope => download_modelscope(spec),
-        };
+        return download(&Hub::for_backend(backend).forced(force), spec);
     }
     Err(format!(
         "model source {spec:?} is neither an existing directory nor a repo id \
@@ -84,143 +281,220 @@ fn graph_from_manifest(manifest_path: &Path, repo_id: &str) -> Result<String, St
         .ok_or_else(|| format!("model.json in {repo_id} is missing the 'graph' field"))
 }
 
-/// Cache-only lookup for the Hugging Face backend: if the hub cache already
-/// holds every file this repo needs, serve from it without contacting the hub.
+/// Fetch a verdict-ready package from `hub`. Two shapes, decided by the
+/// manifest alone -- not by which hub it came from:
 ///
-/// Why: hf-hub has no offline switch, and its `get` re-checks the hub even on
-/// a cache hit -- on a network that drops packets rather than refusing them,
-/// that costs ~20 s of startup (measured). Deliberate trade-off: upstream
-/// changes to a cached repo go unnoticed; these repos are released artifacts,
-/// not moving targets.
-fn from_hf_cache(repo_id: &str) -> Option<PathBuf> {
-    let cached = hf_hub::Cache::from_env().model(repo_id.to_string());
-    let manifest = cached.get("model.json")?;
-    let graph = graph_from_manifest(&manifest, repo_id).ok()?;
-    cached.get(&graph)?;
-    cached.get("tokenizer/tokenizer.json")?;
-    // `<graph>.data` is optional in ONNX and a cache hit cannot tell "repo
-    // has none" from "blob deleted": an incomplete cache surfaces as an
-    // onnxruntime load failure, never a silently wrong answer.
-    manifest.parent().map(Path::to_path_buf)
-}
-
-/// Hugging Face backend: honors HF_ENDPOINT / HF_TOKEN. An existing standard
-/// HF cache entry is served as-is; fresh downloads go through our own
-/// downloader because hf-hub 0.4.3's ureq agent sets no read timeout, so its
-/// downloads can stall forever.
-fn download_hf(repo_id: &str) -> Result<PathBuf, String> {
-    if let Some(snapshot) = from_hf_cache(repo_id) {
+/// - a graph package ships the ONNX graph it names;
+/// - a checkpoint package (torch runtime) ships only the manifest and fetches
+///   its weights from the official repo it declares.
+///
+/// Every file is fetched through [`Hub::get`], which serves a file already in
+/// our own cache without contacting the hub. A completed package carries a
+/// [`COMPLETE`] marker and short-circuits the whole walk, so a warm start
+/// makes no request at all -- without it the optional `<graph>.data` probe
+/// would ask every time (`<graph>.data` is optional in ONNX, and its absence
+/// from the cache cannot be told from "the repo has none"). The hubs' own
+/// caches are never consulted: a verdict-ready repo is not the upstream repo,
+/// and only the former has the manifest we need.
+pub fn download(hub: &Hub, repo_id: &str) -> Result<PathBuf, String> {
+    // A package's OWN files are always read at the hub's default branch; only
+    // the checkpoint names a revision.
+    let dir = hub.cache_dir(repo_id);
+    if dir.join(COMPLETE).is_file() && !hub.force {
         tracing::info!(
+            hub = hub.slug(),
             repo = repo_id,
-            snapshot = %snapshot.display(),
-            "serving the cached snapshot; hub not contacted"
+            cache = %dir.display(),
+            "serving from the cache; hub not contacted"
         );
-        return materialize(repo_id, &snapshot);
+        return Ok(dir);
+    }
+    let branch = hub.default_branch();
+    // One line when a download actually starts. A warm cache returned above, so
+    // this only prints when the hub is about to be hit.
+    tracing::info!(
+        hub = hub.slug(),
+        repo = repo_id,
+        cache = %dir.display(),
+        "downloading"
+    );
+
+    let manifest_path = hub
+        .get(repo_id, branch, "model.json", &dir)
+        .map_err(|err| format!("{err} ({})", hub.manifest_hint()))?;
+    let manifest_raw = std::fs::read_to_string(&manifest_path)
+        .map_err(|err| format!("read {}: {err}", manifest_path.display()))?;
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_raw)
+        .map_err(|err| format!("invalid model.json in {repo_id}: {err}"))?;
+
+    if let Some(decl) = checkpoint_decl(&manifest) {
+        let decl = decl.map_err(|err| format!("invalid model.json in {repo_id}: {err}"))?;
+        let tokenizer_path = hub.get(repo_id, branch, "tokenizer/tokenizer.json", &dir)?;
+        fetch_checkpoint(hub, &dir, &decl)?;
+        tracing::info!(
+            hub = hub.slug(),
+            repo = repo_id,
+            checkpoint = %decl.repo,
+            revision = %decl.revision_on(hub),
+            cache = %dir.display(),
+            tokenizer = %tokenizer_path.display(),
+            "package fetched; weights fetched from the official repo"
+        );
+        write_complete(&dir)?;
+        return Ok(dir);
     }
 
-    // HF_ENDPOINT switches the whole path to a mirror (hf-mirror.com).
-    let endpoint = std::env::var("HF_ENDPOINT")
-        .ok()
-        .map(|e| e.trim_end_matches('/').to_owned())
-        .unwrap_or_else(|| "https://huggingface.co".to_owned());
-    let bearer = std::env::var("HF_TOKEN").ok();
-    let dir = verdict_cache_root()
-        .join("hub")
-        .join(repo_id.replace('/', "--"));
-
-    let manifest_path =
-        hf_get(&endpoint, repo_id, bearer.as_deref(), "model.json", &dir).map_err(|err| {
-            format!("{err} (is this a verdict-ready repo? see the README model section)")
-        })?;
     let graph = graph_from_manifest(&manifest_path, repo_id)?;
-    let graph_path = hf_get(&endpoint, repo_id, bearer.as_deref(), &graph, &dir)?;
+    let graph_path = hub.get(repo_id, branch, &graph, &dir)?;
     // External weights: fetch `<graph>.data` when present (a miss means none).
-    let _ = hf_get(
-        &endpoint,
-        repo_id,
-        bearer.as_deref(),
-        &format!("{graph}.data"),
-        &dir,
-    );
-    let tokenizer_path = hf_get(
-        &endpoint,
-        repo_id,
-        bearer.as_deref(),
-        "tokenizer/tokenizer.json",
-        &dir,
-    )?;
+    let _ = hub.get(repo_id, branch, &format!("{graph}.data"), &dir);
+    let tokenizer_path = hub.get(repo_id, branch, "tokenizer/tokenizer.json", &dir)?;
 
     tracing::info!(
-        hub = "huggingface",
+        hub = hub.slug(),
         repo = repo_id,
         cache = %dir.display(),
         graph = %graph_path.display(),
         tokenizer = %tokenizer_path.display(),
-        "model fetched (HF_ENDPOINT/HF_TOKEN honored)"
+        "model fetched"
     );
+    write_complete(&dir)?;
     Ok(dir)
 }
 
-/// Cache-first fetch of one file from the Hugging Face Hub (or an
-/// HF_ENDPOINT mirror) through our own timeout-guarded downloader.
-fn hf_get(
-    endpoint: &str,
-    repo_id: &str,
-    bearer: Option<&str>,
-    path: &str,
-    dir: &Path,
-) -> Result<PathBuf, String> {
-    let dest = dir.join(path);
-    if dest.is_file() {
-        return Ok(dest);
+/// Marker file in a package directory: every file this package needs is here.
+/// Written LAST, so a run killed mid-fetch leaves it absent and the next start
+/// resumes file by file. Its presence is the only completeness claim we make --
+/// delete it to force a re-check against the hub.
+const COMPLETE: &str = ".complete";
+
+fn write_complete(dir: &Path) -> Result<(), String> {
+    std::fs::write(dir.join(COMPLETE), b"")
+        .map_err(|err| format!("marking {} complete: {err}", dir.display()))
+}
+
+/// A manifest's checkpoint declaration: weights that live in an OFFICIAL repo
+/// (the packager names the repo and the exact file list; the package itself
+/// ships only manifest/tokenizer/checksums, so no model weights are
+/// redistributed by us).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointDecl {
+    pub repo: String,
+    /// The revision the packager pinned, if any. `None` means the hub's own
+    /// default branch, which is what lets one manifest serve both hubs: HF
+    /// has no branch by that name on ModelScope and vice versa.
+    pub revision: Option<String>,
+    pub files: Vec<String>,
+}
+
+impl CheckpointDecl {
+    /// The revision to fetch at, on this hub.
+    pub fn revision_on(&self, hub: &Hub) -> &str {
+        self.revision.as_deref().unwrap_or(hub.default_branch())
     }
-    let url = format!("{endpoint}/{repo_id}/resolve/main/{path}");
-    http_download_auth(&url, &dest, bearer)
-        .map_err(|err| format!("fetching {path} from {repo_id} on Hugging Face: {err}"))?;
-    Ok(dest)
 }
 
-/// Copy the whole hub snapshot (a symlink farm into blobs/) into
-/// ~/.cache/verdict/hub/<org>--<name>/ as REAL files: onnxruntime's
-/// external-data validation resolves symlinks and rejects weights that
-/// "escape" the model directory, and `.data` must sit beside its graph.
-fn materialize(repo_id: &str, snapshot: &Path) -> Result<PathBuf, String> {
-    let dir = verdict_cache_root()
-        .join("hub")
-        .join(repo_id.replace('/', "--"));
-    copy_tree(snapshot, &dir)?;
-    tracing::info!(
-        hub = "huggingface",
-        repo = repo_id,
-        snapshot = %snapshot.display(),
-        cache = %dir.display(),
-        "model fetched and materialized (HF_ENDPOINT/HF_TOKEN honored)"
-    );
-    Ok(dir)
-}
-
-/// Recursive copy that follows symlinks and skips files already in place
-/// (the destination is the cache; re-runs are incremental).
-fn copy_tree(src: &Path, dest: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dest).map_err(|err| format!("mkdir {}: {err}", dest.display()))?;
-    for entry in std::fs::read_dir(src).map_err(|err| format!("read {}: {err}", src.display()))? {
-        let entry = entry.map_err(|err| format!("read {}: {err}", src.display()))?;
-        let from = entry.path();
-        let to = dest.join(entry.file_name());
-        if from.is_dir() {
-            copy_tree(&from, &to)?;
-        } else if to.is_file() {
-            continue; // cached
-        } else {
-            std::fs::copy(&from, &to)
-                .map_err(|err| format!("copy {} -> {}: {err}", from.display(), to.display()))?;
+/// Parse the `"checkpoint"` field of a model manifest. Present = a
+/// torch-runtime package whose weights must be fetched beside model.json.
+pub fn checkpoint_decl(manifest: &serde_json::Value) -> Option<Result<CheckpointDecl, String>> {
+    let decl = manifest.get("checkpoint")?;
+    let bad = |msg: String| Some(Err(msg));
+    let obj = match decl.as_object() {
+        Some(o) => o,
+        None => {
+            return bad(
+                "model.json 'checkpoint' must be an object: {\"repo\", \"files\" \
+                 [, \"revision\"]}"
+                    .to_string(),
+            );
         }
+    };
+    let repo = match obj.get("repo").and_then(|v| v.as_str()) {
+        Some(r) if is_repo_id(r) => r.to_string(),
+        _ => return bad("model.json checkpoint.repo must be an <org>/<name> repo id".to_string()),
+    };
+    let revision = match obj.get("revision") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_str() {
+            Some(r) if !r.is_empty() => Some(r.to_string()),
+            // An empty or non-string revision would silently become
+            // `resolve//<path>` and 404 -- refuse it here instead.
+            _ => {
+                return bad(
+                    "model.json checkpoint.revision must be a non-empty string when present"
+                        .to_string(),
+                );
+            }
+        },
+    };
+    let files: Vec<String> = match obj.get("files").and_then(|v| v.as_array()) {
+        Some(list) => list
+            .iter()
+            .map(|v| {
+                v.as_str().map(str::to_string).ok_or_else(|| {
+                    "model.json checkpoint.files entries must be strings".to_string()
+                })
+            })
+            .collect::<Result<_, _>>()
+            .ok()?,
+        None => {
+            return bad(
+                "model.json checkpoint.files must list the files to fetch (config.json, \
+                 weights, ...)"
+                    .to_string(),
+            );
+        }
+    };
+    if files.is_empty() {
+        return bad("model.json checkpoint.files is empty".to_string());
+    }
+    // A path escape in the file list would write outside the package dir.
+    if files
+        .iter()
+        .any(|f| f.is_empty() || f.starts_with('/') || f.starts_with('.') || f.contains(".."))
+    {
+        return bad("model.json checkpoint.files entries must be plain relative paths".to_string());
+    }
+    Some(Ok(CheckpointDecl {
+        repo,
+        revision,
+        files,
+    }))
+}
+
+/// Fetch the declared checkpoint files into the package directory (flat,
+/// beside model.json -- the layout TorchEngine and the HF cache both
+/// expect). Idempotent per file: an already-present file is a cache hit and
+/// touches no network.
+pub fn fetch_checkpoint(hub: &Hub, dir: &Path, decl: &CheckpointDecl) -> Result<(), String> {
+    let revision = decl.revision_on(hub);
+    let mut last: Option<PathBuf> = None;
+    for file in &decl.files {
+        last = Some(
+            hub.get(&decl.repo, revision, file, dir)
+                .map_err(|err| format!("{err} ({})", hub.checkpoint_hint(&decl.repo)))?,
+        );
+    }
+    if let Some(p) = last {
+        tracing::info!(
+            hub = hub.slug(),
+            repo = %decl.repo,
+            revision = %revision,
+            files = decl.files.len(),
+            cache = %p.parent().map(|d| d.display().to_string()).unwrap_or_default(),
+            "checkpoint fetched from the official repo"
+        );
     }
     Ok(())
 }
 
-/// Verdict's own cache root: $XDG_CACHE_HOME/verdict, else ~/.cache/verdict.
+/// Verdict's own cache root: $VERDICT_CACHE if set (the container case -- one
+/// mount point holds every model), else $XDG_CACHE_HOME/verdict, else
+/// ~/.cache/verdict.
 fn verdict_cache_root() -> PathBuf {
+    if let Ok(dir) = std::env::var("VERDICT_CACHE") {
+        return PathBuf::from(dir);
+    }
     std::env::var("XDG_CACHE_HOME")
         .ok()
         .map(PathBuf::from)
@@ -231,56 +505,6 @@ fn verdict_cache_root() -> PathBuf {
         })
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("verdict")
-}
-
-/// ModelScope backend (VERDICT_USE_MODELSCOPE=1). Download endpoint is the
-/// HF-compatible `models/{org}/{name}/resolve/master/{path}` shape; the
-/// cache lives under ~/.cache/verdict/modelscope/<org>/<name>/.
-fn download_modelscope(repo_id: &str) -> Result<PathBuf, String> {
-    let (org, name) = repo_id
-        .split_once('/')
-        .expect("is_repo_id guarantees one slash");
-    let base = std::env::var("XDG_CACHE_HOME")
-        .ok()
-        .map(|d| PathBuf::from(d).join("verdict"))
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| PathBuf::from(h).join(".cache").join("verdict"))
-        })
-        .unwrap_or_else(|| PathBuf::from("/tmp").join("verdict"))
-        .join("modelscope");
-    let dir = base.join(org).join(name);
-
-    let manifest_path = ms_get(repo_id, "model.json", &dir)
-        .map_err(|err| format!("{err} (is this repo verdict-ready AND hosted on ModelScope?)"))?;
-    let graph = graph_from_manifest(&manifest_path, repo_id)?;
-    let graph_path = ms_get(repo_id, &graph, &dir)?;
-    // External weights: same rule as the HF backend (a miss means none).
-    let _ = ms_get(repo_id, &format!("{graph}.data"), &dir);
-    let tokenizer_path = ms_get(repo_id, "tokenizer/tokenizer.json", &dir)?;
-
-    tracing::info!(
-        hub = "modelscope",
-        repo = repo_id,
-        cache = %dir.display(),
-        graph = %graph_path.display(),
-        tokenizer = %tokenizer_path.display(),
-        "model fetched (VERDICT_USE_MODELSCOPE honored)"
-    );
-    Ok(dir)
-}
-
-/// Cache-first fetch of one file from ModelScope.
-fn ms_get(repo_id: &str, path: &str, dir: &Path) -> Result<PathBuf, String> {
-    let dest = dir.join(path);
-    if dest.is_file() {
-        return Ok(dest);
-    }
-    let url = format!("https://modelscope.cn/models/{repo_id}/resolve/master/{path}");
-    http_download(&url, &dest)
-        .map_err(|err| format!("fetching {path} from {repo_id} on ModelScope: {err}"))?;
-    Ok(dest)
 }
 
 /// A stalled download must fail loudly, not hang forever. Observed in the
@@ -417,11 +641,18 @@ fn download_body(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     let pb = indicatif::ProgressBar::new(total);
-    pb.set_message(
-        dest.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-    );
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    pb.set_message(name.clone());
+    // The bar itself is invisible when stderr is not a terminal -- `docker logs`
+    // is a pipe, so inside a container the user would otherwise watch a silent
+    // multi-GB download and conclude it hung. Log every file, the way docker
+    // pull logs every layer and pip every package; a package is a handful of
+    // files, so this is a dozen lines, not noise.
+
+    let started = std::time::Instant::now();
     let mut reader = response.into_reader();
     let mut file = std::fs::File::create(part)
         .map_err(|err| FetchErr::Terminal(format!("create {}: {err}", part.display())))?;
@@ -449,6 +680,12 @@ fn download_body(
         pb.inc(n as u64);
     }
     pb.finish();
+    tracing::info!(
+        file = %name,
+        bytes = pb.position(),
+        secs = started.elapsed().as_secs(),
+        "downloaded"
+    );
     drop(file);
     std::fs::rename(part, dest).map_err(|err| {
         FetchErr::Terminal(format!(

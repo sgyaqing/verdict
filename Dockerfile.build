@@ -1,0 +1,107 @@
+# Verdict CPU image, built from source in one go. Release builds use
+# Dockerfile (thin layer on the prebuilt base) and come here only for the
+# verdict-bin stage.
+#
+# Build:  docker buildx build --platform linux/amd64 -t <ns>/verdict:<ver>-cpu .
+# Run:    docker run -p 8080:8080 -v $PWD/<model-dir>:/model:ro verdict:<ver>-cpu
+# PIP_INDEX_URL / APT_MIRROR redirect the downloads below; unset keeps stock
+# sources.
+
+# ---- onnxruntime --------------------------------------------------------
+# The engine dlopens the .so by soname; the wheel version is pinned to match.
+FROM python:3.12-slim AS ort
+ARG ORT_VERSION=1.30.0
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+        [ -f "$f" ] && sed -i "s|deb.debian.org|$APT_MIRROR|g" "$f"; \
+      done; \
+    fi
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends unzip; \
+    rm -rf /var/lib/apt/lists/*; \
+    pip download --no-deps --only-binary=:all: -i "${PIP_INDEX_URL}" \
+        -d /tmp/ort "onnxruntime==${ORT_VERSION}"; \
+    mkdir -p /ort; \
+    unzip -j -o /tmp/ort/onnxruntime-*.whl 'onnxruntime/capi/libonnxruntime.so*' -d /ort; \
+    ls -l /ort
+
+# ---- builder ------------------------------------------------------------
+FROM rust:1.90-slim AS builder
+WORKDIR /build
+
+# CARGO_MIRROR is a sparse index URL; g++ is needed by cc-rs.
+ARG CARGO_MIRROR=""
+RUN if [ -n "$CARGO_MIRROR" ]; then \
+      printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n' \
+        "$CARGO_MIRROR" > "${CARGO_HOME:-/usr/local/cargo}/config.toml"; \
+    fi
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+        [ -f "$f" ] && sed -i "s|deb.debian.org|$APT_MIRROR|g" "$f"; \
+      done; \
+    fi
+# Installed before the COPYs so src-only changes reuse the cached layer.
+RUN apt-get update && apt-get install -y --no-install-recommends g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+# onnxruntime is dlopened at runtime (ort load-dynamic); the build needs no
+# headers. torch_exec.py must exist at compile time: torch_engine.rs embeds it
+# with include_str!. The exact file, not the executor/ dir -- the dir also
+# holds a __pycache__ that does not belong in the image.
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY executor/torch_exec.py ./executor/torch_exec.py
+# Cache mounts are not part of the layer snapshot: the binary must be copied
+# out in the SAME RUN -- a later COPY of target/ finds nothing.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release && cp target/release/verdict ./verdict
+
+# Export with:
+#   docker buildx build --target verdict-bin --output type=local,dest=bin/ .
+FROM scratch AS verdict-bin
+COPY --from=builder /build/verdict /verdict
+
+# ---- runtime ------------------------------------------------------------
+# trixie, not bookworm: the runtime glibc must match rust:1.90-slim or the
+# binary fails with GLIBC_2.38-not-found. No C toolchain: the CPU image runs
+# prebuilt ORT kernels only (see Dockerfile.build.cuda for the CUDA case).
+FROM debian:trixie-slim
+
+# No maintainer/author labels.
+ARG VERSION=0.0.0
+ARG REVISION=
+LABEL org.opencontainers.image.title="Verdict" \
+      org.opencontainers.image.description="A high-performance serving engine for System One decision models" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.source="https://github.com/sgyaqing/verdict" \
+      org.opencontainers.image.url="https://github.com/sgyaqing/verdict" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+        [ -f "$f" ] && sed -i "s|deb.debian.org|$APT_MIRROR|g" "$f"; \
+      done; \
+    fi
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /build/verdict /usr/local/bin/verdict
+# ldconfig puts the .so on the loader path ort's fallback dlopens; the
+# engine's exe-dir lookup does not see /usr/local/lib.
+COPY --from=ort /ort/libonnxruntime.so.1.30.0 /usr/local/lib/libonnxruntime.so.1.30.0
+RUN ln -s libonnxruntime.so.1.30.0 /usr/local/lib/libonnxruntime.so \
+    && ldconfig
+
+VOLUME /model
+EXPOSE 8080
+ENTRYPOINT ["verdict"]
+CMD ["serve", "/model", "--host", "0.0.0.0", "--port", "8080"]

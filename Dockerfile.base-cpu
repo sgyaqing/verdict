@@ -1,0 +1,37 @@
+# Verdict CPU base image: runtime dependencies, carved from the published
+# 0.2.0-cpu image (the donor). Release images (Dockerfile) add only the
+# binary layer.
+#
+# Build:
+#   docker buildx build -f Dockerfile.base-cpu --platform linux/amd64 \
+#     -t sgyaqing/verdict:base-0.2-cpu --load .
+
+FROM sgyaqing/verdict:0.2.0-cpu AS donor
+
+# debian, not python: the CPU engine never spawns python. glibc must match the
+# builder (rust:1.90-slim = trixie). No C toolchain: CPU runs prebuilt ORT
+# kernels only (the CUDA image is the one that JITs and needs build-essential).
+FROM debian:trixie-slim
+
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+        [ -f "$f" ] && sed -i "s|deb.debian.org|$APT_MIRROR|g" "$f"; \
+      done; \
+    fi
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# ldconfig puts the .so on the loader path ort's fallback dlopens; the
+# engine's exe-dir lookup does not see /usr/local/lib.
+COPY --from=donor /usr/local/lib/libonnxruntime.so.1.30.0 /usr/local/lib/
+RUN ln -s libonnxruntime.so.1.30.0 /usr/local/lib/libonnxruntime.so \
+    && ldconfig
+
+VOLUME /model
+EXPOSE 8080
+ENTRYPOINT ["verdict"]
+CMD ["serve", "/model", "--host", "0.0.0.0", "--port", "8080"]

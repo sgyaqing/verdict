@@ -1,6 +1,6 @@
 [package]
 name = "verdict-serve"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "A high-performance serving engine for System One decision models"
@@ -20,12 +20,14 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8.9"
+# bulk request/reply payloads to the torch executor travel as base64 bytes
+# (JSON text of 8k floats costs ~10 ms/batch; b64 is two memcpys)
+base64 = "0.22"
 # Stream adapters for the SSE chat surface; already in the graph via
 # axum -- declaring it only makes the direct use legal, default-features off.
 futures-util = { version = "0.3", default-features = false }
-# sync ureq client only -- no reqwest/tokio side, no xet
-hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
-# direct use of an hf-hub transitive dep
+# The only HTTP client: blocking, no reqwest/tokio side, no xet. Both hubs
+# are fetched through it.
 ureq = "2.12"
 indicatif = "0.17"
 metrics = "0.23.1"

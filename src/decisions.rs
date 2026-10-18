@@ -1,6 +1,6 @@
 //! `/v1/decisions`: OpenAI's cross-ecosystem Decisions API -- the dialect
-//! LiteLLM's unified decision endpoint and SGLang serve alongside
-//! `/v1/systemone`. One request carries one `input` (shared evidence) plus a
+//! LiteLLM's unified decision endpoint serves alongside `/v1/systemone`. One
+//! request carries one `input` (shared evidence) plus a
 //! LIST of typed questions; answers come back as a parallel array.
 //!
 //! Schema source of truth: the installed OpenAI SDK 3.26.0
@@ -15,11 +15,11 @@
 //!     rendering as the Jev criteria), and the answer echoes the original
 //!     JSON type.
 //!   - The dialect defines a fourth answer type, `refusal` ("the host may
-//!     decline one question"); Verdict never emits it -- no host-side safety
-//!     layer stands between the caller and the model.
+//!     decline one question"); Verdict emits only the three model-derived
+//!     answer types.
 //!   - Like `/v1/systemone`, an adapter over already-graded semantics: every
 //!     question is one engine task; the correctness gate is mapping tests
-//!     Malformed questions answer 400 in Verdict's
+//!     (tests/decisions.rs). Malformed questions answer 400 in Verdict's
 //!     unified error envelope, the message naming the question (by name when
 //!     present, else by index).
 

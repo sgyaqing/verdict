@@ -1,0 +1,169 @@
+# Verdict CUDA image, built from source in one go. Release builds use
+# Dockerfile.cuda (thin layer on the prebuilt base) and come here only for the
+# verdict-bin stage.
+#
+# Build (the ~1.5 GB wheel set arrives as a named context, never as part of
+# the main context):
+#   docker buildx build -f Dockerfile.build.cuda \
+#     --build-context cudawheels=<wheel-dir> \
+#     --platform linux/amd64 -t <ns>/verdict:<ver>-cuda --load .
+# Run:  docker run --gpus all -p 8080:8080 -v $PWD/<model-dir>:/model:ro \
+#           verdict:<ver>-cuda
+# --gpus all is not optional: without the host's NVIDIA runtime the engine
+# finds no CUDA and quietly serves on CPU.
+#
+# The wheel set: onnxruntime-gpu 1.30.0 plus its [cuda,cudnn] nvidia-*
+# dependencies, cp312 / py3-none manylinux x86_64 -- seven wheels. cuBLAS is
+# in neither extra and must be pinned separately, or the resulting
+# onnxruntime cannot find libcublas. Resolve via the PyPI JSON API.
+
+# ---- extract the CUDA library set from the wheels ------------------------
+# A global ARG before the first FROM reaches only the FROM lines, so each
+# stage repeats the APT_MIRROR block.
+FROM debian:trixie-slim AS cuda
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+        [ -f "$f" ] && sed -i "s|deb.debian.org|$APT_MIRROR|g" "$f"; \
+      done; \
+    fi
+RUN apt-get update && apt-get install -y --no-install-recommends unzip \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=cudawheels / /tmp/wheels/
+RUN set -eux; \
+    mkdir -p /ort /cudalibs; \
+    unzip -j -o /tmp/wheels/onnxruntime_gpu-*.whl 'onnxruntime/capi/libonnxruntime*.so*' -d /ort; \
+    for w in /tmp/wheels/nvidia_*.whl; do \
+      unzip -j -o "$w" 'nvidia/*/lib/*.so*' -d /cudalibs; \
+    done; \
+    ls -l /ort; echo "cuda libs: $(ls /cudalibs | wc -l)"; \
+    # Wildcards on purpose (names change between versions); the test -f pair
+    # is what fails the build when a provider library goes missing -- an
+    # absent CUDA provider still starts and silently serves on CPU.
+    test -f /ort/libonnxruntime_providers_cuda.so; \
+    test -f /ort/libonnxruntime_providers_shared.so
+
+# ---- torch runtime stack (pinned) -----------------------------------------
+# The torch executor spawns python3.12 with exactly this stack. The pins are
+# load-bearing: the kernels and the bf16 tolerances were validated against
+# these builds; floating them invalidates the graded tolerances.
+FROM python:3.12-slim-trixie AS torch
+RUN pip install --no-cache-dir \
+      --extra-index-url https://download.pytorch.org/whl/cu130 \
+      torch==2.14.1+cu130 \
+      triton==3.8.0 \
+      transformers==5.19.0 \
+      flash-linear-attention==0.5.2 \
+      fla-core==0.5.2
+
+# ---- causal-conv1d --------------------------------------------------------
+# PyPI ships only an sdist; it compiles here against the pinned torch.
+# transformers' Qwen3.5 path falls back to a slower reference conv without
+# this kernel. Built FROM torch so the stack is installed once; this stage's
+# layers (nvcc, headers, build tree) never reach the final image.
+FROM torch AS cc1build
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+        [ -f "$f" ] && sed -i "s|deb.debian.org|$APT_MIRROR|g" "$f"; \
+      done; \
+    fi
+COPY docker/cc1_build.sh /tmp/cc1_build.sh
+RUN bash /tmp/cc1_build.sh
+
+# The runtime copies site-packages from HERE, not from an anonymous
+# `FROM torch` -- the wheel must land in a stage the runtime references, or
+# the image silently lacks the kernel.
+FROM torch AS torch_final
+COPY --from=cc1build /wheels/causal_conv1d-*.whl /tmp/
+RUN python -c "import zipfile,glob; zipfile.ZipFile(glob.glob('/tmp/causal_conv1d-*.whl')[0]).extractall('/tmp/cc1check')" \
+    && python -c "import sys; sys.path.insert(0,'/tmp/cc1check'); import causal_conv1d; print('wheel importable')" \
+    && rm -rf /tmp/cc1check
+RUN pip install --no-cache-dir /tmp/causal_conv1d-*.whl \
+    && python -c "import causal_conv1d; print('installed', causal_conv1d.__version__)" \
+    && rm -f /tmp/causal_conv1d-*.whl
+
+# ---- builder (same shape as the CPU image) -------------------------------
+FROM rust:1.90-slim AS builder
+WORKDIR /build
+
+ARG CARGO_MIRROR=""
+RUN if [ -n "$CARGO_MIRROR" ]; then \
+      printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n' \
+        "$CARGO_MIRROR" > "${CARGO_HOME:-/usr/local/cargo}/config.toml"; \
+    fi
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+        [ -f "$f" ] && sed -i "s|deb.debian.org|$APT_MIRROR|g" "$f"; \
+      done; \
+    fi
+# Installed before the COPYs so src-only changes reuse the cached layer.
+RUN apt-get update && apt-get install -y --no-install-recommends g++ \
+    && rm -rf /var/lib/apt/lists/*
+# torch_exec.py must exist at compile time: torch_engine.rs embeds it with
+# include_str!. The exact file, not the executor/ dir -- the dir also holds a
+# __pycache__ that does not belong in the image.
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY executor/torch_exec.py ./executor/torch_exec.py
+# Cache mounts are not part of the layer snapshot: the binary must be copied
+# out in the SAME RUN -- a later COPY of target/ finds nothing.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release && cp target/release/verdict ./verdict
+
+# Export with:
+#   docker buildx build -f Dockerfile.build.cuda --target verdict-bin \
+#       --output type=local,dest=bin/ .
+FROM scratch AS verdict-bin
+COPY --from=builder /build/verdict /verdict
+
+# ---- runtime ------------------------------------------------------------
+# python, not debian: the torch executor spawns python3.12; trixie keeps the
+# glibc generation matching the builder.
+FROM python:3.12-slim-trixie
+
+# No maintainer/author labels.
+ARG VERSION=0.0.0
+ARG REVISION=
+LABEL org.opencontainers.image.title="Verdict (CUDA)" \
+      org.opencontainers.image.description="A high-performance serving engine for System One decision models (CUDA execution provider + torch runtime)" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.source="https://github.com/sgyaqing/verdict" \
+      org.opencontainers.image.url="https://github.com/sgyaqing/verdict" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+# The C toolchain is a runtime dependency (triton JITs kernels on first use);
+# gcc is not enough -- C headers live in libc6-dev via build-essential.
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+      for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do \
+        [ -f "$f" ] && sed -i "s|deb.debian.org|$APT_MIRROR|g" "$f"; \
+      done; \
+    fi
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgomp1 build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+WORKDIR /app
+COPY --from=builder /build/verdict /usr/local/bin/verdict
+# Ship the whole capi/ set including the EP plugins loaded by soname: without
+# providers_cuda.so the provider never loads and the engine serves on CPU.
+COPY --from=cuda /ort/ /usr/local/lib/
+COPY --from=cuda /cudalibs/ /usr/local/lib/
+RUN ln -s libonnxruntime.so.1.30.0 /usr/local/lib/libonnxruntime.so \
+    && ldconfig
+# torch finds its bundled CUDA libs by rpath; no ldconfig needed for these.
+# From torch_final, not torch: torch is the pre-cc1 stage.
+COPY --from=torch_final /usr/local/lib/python3.12/site-packages \
+     /usr/local/lib/python3.12/site-packages
+
+VOLUME /model
+EXPOSE 8080
+ENTRYPOINT ["verdict"]
+CMD ["serve", "/model", "--host", "0.0.0.0", "--port", "8080"]

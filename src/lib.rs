@@ -13,7 +13,7 @@
 //! ```no_run
 //! # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
 //! let cfg = verdict::cli::parse_args(&[
-//!     "verdict".to_string(), "serve".to_string(), "models/laya-onnx".to_string(),
+//!     "verdict".to_string(), "serve".to_string(), "models/laya-output".to_string(),
 //! ])?;
 //! let engine = verdict::engine::StubEngine::new(std::time::Duration::ZERO);
 //! let engine: std::sync::Arc<dyn verdict::engine::Engine> = std::sync::Arc::new(engine);
@@ -27,6 +27,7 @@ pub mod cli;
 pub mod compat;
 pub mod decisions;
 pub mod engine;
+pub mod family;
 pub mod metrics;
 pub mod model_source;
 pub mod pipeline;
@@ -35,6 +36,7 @@ pub mod replay;
 pub mod scheduler;
 pub mod systemone;
 pub mod tokenize;
+pub mod torch_engine;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

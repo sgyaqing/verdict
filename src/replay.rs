@@ -28,8 +28,32 @@ struct GoldenDoc {
 
 #[derive(serde::Deserialize)]
 struct GoldenCase {
-    expected_token_ids: Vec<u32>,
-    expected_logits: Vec<f64>,
+    /// The letter-readout schema stores one entry per engine row (a score
+    /// request is one row per isolated level); the singular fields remain
+    /// the marker families' schema.
+    #[serde(default)]
+    rows: Option<Vec<GoldenRow>>,
+    expected_token_ids: Option<Vec<u32>>,
+    expected_logits: Option<Vec<f64>>,
+    /// Zero-shot noul cases carry the context-free debias pass the pipeline
+    /// also submits; the replay table must answer it or replay errors.
+    null_forward: Option<NullCase>,
+    /// The criteria-composed noul pair (letter family): the sequence the
+    /// systemone adapter renders from Jev criteria, which no native case
+    /// produces -- the replay table answers it for the mapping tests.
+    criteria_forward: Option<NullCase>,
+}
+
+#[derive(serde::Deserialize)]
+struct GoldenRow {
+    token_ids: Vec<u32>,
+    logits: Vec<f64>,
+}
+
+#[derive(serde::Deserialize)]
+struct NullCase {
+    token_ids: Vec<u32>,
+    logits: Vec<f64>,
 }
 
 pub struct ReplayEngine {
@@ -37,7 +61,8 @@ pub struct ReplayEngine {
 }
 
 impl ReplayEngine {
-    /// Load all three golden files from a golden directory.
+    /// Load the three golden files (`choice.json`, `score.json`,
+    /// `noul.json`) from a directory.
     pub fn from_golden_dir(golden_dir: &Path) -> Result<Self, ReplayError> {
         let mut table = HashMap::new();
         for task in ["choice", "score", "noul"] {
@@ -54,7 +79,25 @@ impl ReplayEngine {
             for case in doc.cases {
                 // Duplicate sequences would mean duplicate corpus inputs; the
                 // later entry wins, and identical inputs imply identical logits.
-                table.insert(case.expected_token_ids, case.expected_logits);
+                if let Some(null) = case.null_forward {
+                    table.insert(null.token_ids, null.logits);
+                }
+                if let Some(crit) = case.criteria_forward {
+                    table.insert(crit.token_ids, crit.logits);
+                }
+                match case.rows {
+                    Some(rows) => {
+                        for row in rows {
+                            table.insert(row.token_ids, row.logits);
+                        }
+                    }
+                    None => {
+                        table.insert(
+                            case.expected_token_ids.expect("singular schema fields"),
+                            case.expected_logits.expect("singular schema fields"),
+                        );
+                    }
+                }
             }
         }
         Ok(Self { table })

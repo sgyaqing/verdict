@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 — 2026-10-17
+
+- **Two new models**: decider-2b (Qwen3.5-2B, 32768-token context, bf16) and von (ModernBERT-large, 8192-token context), on both Hugging Face and ModelScope.
+- **PyTorch runtime**: the Rust engine drives a pinned PyTorch stack running the official checkpoint — for model families with no ONNX export path.
+- **Model package upgrade**: a package can declare its upstream checkpoint instead of carrying weights (decider-2b fetches from the official `Mapika/decider-2b` repo on first serve); downloader rewritten in-house (resumable, atomic); single `~/.cache/verdict` cache; new `--force-download` flag and `VERDICT_CACHE` variable.
+
+Images on Docker Hub: `sgyaqing/verdict:0.2.0-cpu` and `sgyaqing/verdict:0.2.0-cuda` (linux/amd64).
+
 ## 0.1.0 — 2026-10-11
 
 A high-performance serving engine for System One decision models.

@@ -8,7 +8,7 @@
 //! the chat `content` is the human-readable ANSWER text (drop-in for vLLM
 //! structured-choice clients) while the `verdict` extension carries the full
 //! native payload; usage is prompt = total, completion = 0 (vLLM pooling
-//! behavior, verified in-source); `structured_outputs: {"choice": [...]}`
+//! behavior); `structured_outputs: {"choice": [...]}`
 //! is accepted as an `options` alias.
 
 use std::sync::Arc;
