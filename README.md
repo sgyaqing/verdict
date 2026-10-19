@@ -78,13 +78,18 @@ The official server refused requests at concurrency 64, so its line ends at conc
 # the -v mount caches the model: the first run downloads it, later runs reuse the cache
 docker run --rm --gpus all -p 8080:8080 \
     -v ~/.cache/verdict:/root/.cache/verdict \
-    sgyaqing/verdict:0.2.0-cuda serve verdict-models/decider-2b --host 0.0.0.0
+    sgyaqing/verdict:latest-cuda serve verdict-models/decider-2b --host 0.0.0.0
 
 # ModelScope:
 docker run --rm --gpus all -p 8080:8080 \
     -e VERDICT_USE_MODELSCOPE=1 \
     -v ~/.cache/verdict:/root/.cache/verdict \
-    sgyaqing/verdict:0.2.0-cuda serve sgyaqing/decider-2b --host 0.0.0.0
+    sgyaqing/verdict:latest-cuda serve sgyaqing/decider-2b --host 0.0.0.0
+
+# CPU host
+docker run --rm -p 8080:8080 \
+    -v ~/.cache/verdict:/root/.cache/verdict \
+    sgyaqing/verdict:latest-cpu serve verdict-models/von --host 0.0.0.0
 ```
 
 Once started, you can test it with:
@@ -392,7 +397,7 @@ For the CUDA image:
 
 ## Roadmap
 
-- **v0.2.5** -- a public conversion tool: turn a System One checkpoint into a Verdict-ready package with one command.
+- **v0.3** -- a public conversion tool: turn a System One checkpoint into a Verdict-ready package with one command.
 
 ## License
 

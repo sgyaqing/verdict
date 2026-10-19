@@ -131,7 +131,7 @@ Flags:
                             N>1 serves far more requests/s -- see README)
 
 Environment:
-  HF_ENDPOINT               alternate hub endpoint (mirror)
+  HF_ENDPOINT               alternate hub endpoint
   HF_TOKEN / MODELSCOPE_API_TOKEN   gated-repo auth
   VERDICT_USE_MODELSCOPE=1  resolve repo ids against ModelScope
   VERDICT_CACHE             where downloaded packages land (default $XDG_CACHE_HOME/verdict)

@@ -4,8 +4,8 @@
 //! auto-download into a cache and re-runs hit it -- the vLLM `serve <model>`
 //! habit.
 //!
-//! Backends: the Hugging Face Hub (default; `HF_ENDPOINT` switches to a
-//! mirror endpoint, `HF_TOKEN` authenticates gated
+//! Backends: the Hugging Face Hub (default; `HF_ENDPOINT` switches to an
+//! alternate endpoint, `HF_TOKEN` authenticates gated
 //! repos) and ModelScope (`VERDICT_USE_MODELSCOPE=1`;
 //! `MODELSCOPE_API_TOKEN` for auth). Both hubs download through one shared
 //! stall-guarded downloader (per-read timeout, bounded retries, atomic
@@ -64,8 +64,8 @@ impl Hub {
     pub fn for_backend(backend: HubBackend) -> Self {
         match backend {
             HubBackend::Hf => {
-                // HF_ENDPOINT switches the whole path to a mirror
-                // (a mirror endpoint); HF_TOKEN authenticates gated repos.
+                // HF_ENDPOINT switches the whole path to an alternate
+                // endpoint; HF_TOKEN authenticates gated repos.
                 let endpoint = std::env::var("HF_ENDPOINT")
                     .ok()
                     .map(|e| e.trim_end_matches('/').to_owned())
@@ -163,8 +163,7 @@ impl Hub {
             HubBackend::ModelScope => format!(
                 "these weights come from the official repo {repo}, which may not be mirrored \
                  on ModelScope under that name; serve it from Hugging Face instead \
-                 (drop VERDICT_USE_MODELSCOPE, and set HF_ENDPOINT if you fetch \
-                 through a mirror)"
+                 (drop VERDICT_USE_MODELSCOPE)"
             ),
         }
     }
@@ -182,7 +181,7 @@ impl Hub {
     fn cache_dir(&self, repo_id: &str) -> PathBuf {
         // The model NAME, not the repo id: the two hubs are held to the same
         // content (an operational rule), so `verdict-models/von` on one and
-        // `sgyaqing/von` on the other are one artifact and must share a slot.
+        // `example-org/von` on the other are one artifact and must share a slot.
         // Two DIFFERENT repos that happen to share a name would collide -- a
         // refresh/override flag is the escape hatch, and is not built yet.
         let (_, name) = repo_id
@@ -220,6 +219,28 @@ impl Hub {
                 "fetching {path} from {repo_id} on {}: {err}",
                 self.display()
             )),
+        }
+    }
+
+    /// Optional-file probe: a single attempt, no retries -- ModelScope answers
+    /// an absent file with HTTP 500, and the retry ladder would burn its full
+    /// backoff budget on every first pull of a repo without that file.
+    pub fn get_optional(
+        &self,
+        repo_id: &str,
+        revision: &str,
+        path: &str,
+        dir: &Path,
+    ) -> Result<PathBuf, String> {
+        let dest = dir.join(path);
+        if dest.is_file() && !self.force {
+            return Ok(dest);
+        }
+        let url = self.file_url(repo_id, revision, path);
+        let agent = http_agent();
+        match http_download_once(&agent, &url, &dest, self.bearer.as_deref()) {
+            Ok(()) => Ok(dest),
+            Err(_) => Err(format!("optional {path} absent")),
         }
     }
 }
@@ -347,7 +368,7 @@ pub fn download(hub: &Hub, repo_id: &str) -> Result<PathBuf, String> {
     let graph = graph_from_manifest(&manifest_path, repo_id)?;
     let graph_path = hub.get(repo_id, branch, &graph, &dir)?;
     // External weights: fetch `<graph>.data` when present (a miss means none).
-    let _ = hub.get(repo_id, branch, &format!("{graph}.data"), &dir);
+    let _ = hub.get_optional(repo_id, branch, &format!("{graph}.data"), &dir);
     let tokenizer_path = hub.get(repo_id, branch, "tokenizer/tokenizer.json", &dir)?;
 
     tracing::info!(

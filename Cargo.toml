@@ -1,6 +1,6 @@
 [package]
 name = "verdict-serve"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "Apache-2.0"
 description = "A high-performance serving engine for System One decision models"

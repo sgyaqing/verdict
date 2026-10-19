@@ -284,7 +284,18 @@ impl Pipeline {
     /// Graceful shutdown: close intake, drain, join (called AFTER the HTTP
     /// side has stopped accepting and connections drained).
     pub async fn shutdown(self) {
-        self.scheduler.shutdown().await;
+        let Self {
+            scheduler,
+            bundle,
+            calibration,
+            engine,
+            max_input_tokens: _,
+            served_model: _,
+        } = self;
+        scheduler.shutdown().await;
+        // Leaks on purpose: the drain above is complete and the engine's
+        // native session teardown deadlocks (CPU) or aborts (CUDA) at exit.
+        std::mem::forget((bundle, calibration, engine));
     }
 }
 

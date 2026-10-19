@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1 — 2026-10-19
+
+- **Clean exit**: after the SIGINT drain the process now exits immediately; the previous native teardown path could hang (CPU) or abort (CUDA) at exit. Serving behavior and accuracy were never affected.
+- **Faster ModelScope downloads**: a missing optional file no longer costs ~5 s of retries on first download.
+
+Images on Docker Hub: `sgyaqing/verdict:0.2.1-cpu` and `sgyaqing/verdict:0.2.1-cuda` (linux/amd64).
+
 ## 0.2.0 — 2026-10-17
 
 - **Two new models**: decider-2b (Qwen3.5-2B, 32768-token context, bf16) and von (ModernBERT-large, 8192-token context), on both Hugging Face and ModelScope.

@@ -57,7 +57,8 @@ pub fn init_tracing() {
 /// gets its own scheduler and pipeline; [`pipeline::Pool`] multiplexes them.
 /// Shutdown order is pinned: stop accepting -> in-flight
 /// connections drain (axum) -> scheduler intake closes -> queued requests
-/// drain -> join (every replica).
+/// drain -> join (every replica) -> engines leak (native teardown is unsafe
+/// at exit; see [`pipeline::Pipeline::shutdown`]).
 pub async fn run_server(
     cfg: cli::ServeConfig,
     engines: Vec<Arc<dyn engine::Engine>>,
