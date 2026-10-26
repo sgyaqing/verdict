@@ -10,3 +10,5 @@
 !src
 !executor
 !docker/cc1_build.sh
+!LICENSE
+!NOTICE

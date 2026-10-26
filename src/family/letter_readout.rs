@@ -1,51 +1,19 @@
-//! The letter-readout family recipe: decoder backbone scored at single
-//! "Answer: (" slots, one typed question per row, by-type temperature.
-//!
-//! Re-typed from this family's official Python SDK and pinned by this
-//! family's golden vectors (tokenization and calibration parity). Per-model
-//! data (temperatures, budgets, graph) comes
-//! from model.json via the generic loaders; only the recipe lives here.
-//!
-//! Row shape (one engine task): `Context:\n<state>` (truncated to the state
-//! budget, jointly with the prefix -- the cap slices `Context:\n` + state
-//! together, exactly the official arithmetic) + `\n\nQuestion: <text>
-//! \nOptions:` + one option line per option + `\nAnswer: (`. The slot is the
-//! final " (" token; the graph returns that position's logits restricted to
-//! the option-letter tokens. A serving row carries exactly ONE question (the
-//! official independent path), so questions are never numbered and answers
-//! cannot see each other.
-//!
-//! Option rendering has two shapes, and the boundary matters: at most 10
-//! options ("narrow") join the whole question block into ONE encode with
-//! "(A)".."(J)" prefixes; above that ("wide", up to 255) every option is
-//! `\n(` + one label token + `) <text>` assembled from token ids so each
-//! label is a single token however the text encodes.
-//!
-//! Score questions run ISOLATED (this checkpoint's semantics): one yes/no
-//! row per level, the level text stripped of any leading "N: " number, and
-//! the answer recombined by normalising the per-level P(yes).
-
 use crate::calibration::{CalibCtx, Calibrated, CalibrationConfig, argmax, round4, softmax};
 use crate::tokenize::{BuiltSequence, TokenizerBundle};
 
-/// Narrow rendering covers at most this many options (official NARROW).
 pub const NARROW: usize = 10;
-/// Width of the letter-label head (official MAX_OPTIONS).
+
 pub const MAX_OPTIONS: usize = 255;
-/// Single-token letters for the narrow rendering, in option order.
+
 pub const LETTERS: [&str; NARROW] = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"];
-/// The fixed noul pair when the caller supplies no criteria (official
-/// render_question): option 1 is "yes", so p[1] == P(true).
+
 pub const NOUL_DEFAULT_PAIR: [&str; 2] = ["no", "yes"];
-/// A noul question may carry its meaning in the true/false descriptions; the
-/// question text is then this fixed sentence (official NOUL_WITHOUT_INSTRUCTIONS).
+
 pub const NOUL_WITHOUT_INSTRUCTIONS: &str = "Which answer fits the context?";
-/// Isolated score row template (official ISOLATED).
+
 const ISOLATED: &str = "\nProposed answer: ";
 const ISOLATED_TAIL: &str = "\nDoes the proposed answer fit?";
 
-/// Option texts in letter order: choice/score pass through, noul renders the
-/// fixed no/yes pair unless the caller supplied both sides (Jev criteria).
 pub fn render_options(task: &str, options: &[String]) -> Vec<String> {
     match task {
         "choice" | "score" => options.to_vec(),
@@ -59,11 +27,6 @@ pub fn render_options(task: &str, options: &[String]) -> Vec<String> {
     }
 }
 
-/// Strip a leading level number (official strip_level_number,
-/// `^\s*-?\d+\s*:\s*`): dataset legends carry "2: somewhat" but an isolated
-/// level must not show its number. Python `\d` also matches non-ASCII decimal
-/// digits; ASCII covers every real legend (same caveat as the second family's
-/// digit split).
 pub fn strip_level_number(text: &str) -> &str {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
@@ -101,26 +64,16 @@ pub fn strip_level_number(text: &str) -> &str {
     &text[byte..]
 }
 
-/// Build ONE row (official prompt.build with a single question, option order
-/// preserved). `question` is the fully-composed question text; `options` are
-/// the option texts. The slot sits at the last id; `nopts` rides the sequence
-/// for the letter graph dialect (one slot per row).
 fn build_row(
     bundle: &TokenizerBundle,
     question: &str,
     state: &str,
     options: &[String],
 ) -> BuiltSequence {
-    // The state cap slices the prefix and the state JOINTLY (official:
-    // encode("Context:\n" + state)[:max_state_tokens]) -- truncating the state
-    // alone would off-by the prefix's own tokens.
     let ctx = bundle.encode_plain(&format!("Context:\n{state}"));
     let mut ids: Vec<u32> = ctx.into_iter().take(bundle.layout.max_len).collect();
     let nopts = options.len();
     if nopts <= NARROW {
-        // One encode of the whole question block: the official narrow path
-        // builds the string first, so token merges across the block boundary
-        // are part of the contract.
         let mut block = format!("\n\nQuestion: {question}\nOptions:");
         for (j, opt) in options.iter().enumerate() {
             block.push_str(&format!("\n({}) {}", LETTERS[j], opt));
@@ -129,8 +82,6 @@ fn build_row(
         ids.extend(bundle.encode_plain(&block));
     } else {
         ids.extend(bundle.encode_plain(&format!("\n\nQuestion: {question}\nOptions:")));
-        // Wide: "\n(" + label token + ") text" per option, ids assembled so
-        // every label is the single token from the derived table.
         let open = bundle.encode_plain("\n(");
         for (j, opt) in options.iter().enumerate() {
             ids.extend_from_slice(&open);
@@ -139,21 +90,20 @@ fn build_row(
         }
         ids.extend(bundle.encode_plain("\nAnswer: ("));
     }
-    let slot = ids.len() - 1; // the final " (" id; markers carries it so the
-    // collated marker_pos tensor IS the graph's slot_idx input (one per row)
+    let slot = ids.len() - 1;
     let full_len = ids.len();
     BuiltSequence {
         ids,
         markers: vec![slot],
         full_len,
         state_tokens: 0,
+        media: Vec::new(),
+        text: String::new(),
+        prefix_len: 0,
         nopts: vec![nopts],
     }
 }
 
-/// Build every engine row of one task request (official plan_rows for the
-/// independent path): choice/noul are a single row; score runs one isolated
-/// yes/no row per level and the answer recombines them downstream.
 pub fn build_rows(
     bundle: &TokenizerBundle,
     task: &str,
@@ -177,8 +127,6 @@ pub fn build_rows(
         .collect()
 }
 
-/// Input tokens of a request whose rows share a prefix (the state): the
-/// prefix counts once (official unique_tokens). One row counts itself.
 pub fn unique_tokens(rows: &[&[u32]]) -> u64 {
     if rows.len() < 2 {
         return rows.iter().map(|r| r.len() as u64).sum();
@@ -201,12 +149,6 @@ pub fn unique_tokens(rows: &[&[u32]]) -> u64 {
             .sum::<u64>()
 }
 
-// -------------------------------------------------------- state serialization
-
-/// The family's state serializer: a string passes through; anything else is
-/// dumped Python-style with long arrays position-annotated (official
-/// render_state + annotate_indices -- a path such as `records[47].text`
-/// otherwise makes the model count 47 elements).
 pub fn serialize_state(state: &serde_json::Value) -> String {
     use serde_json::Value;
     match state {
@@ -215,9 +157,6 @@ pub fn serialize_state(state: &serde_json::Value) -> String {
     }
 }
 
-/// official annotate_indices, min_len 8: arrays at or above the threshold
-/// carry each element's `_index` (dicts gain the key first; other values are
-/// wrapped as {"_index", "value"}); shorter arrays and every dict recurse.
 fn annotate_indices(v: &serde_json::Value) -> serde_json::Value {
     use serde_json::{Map, Value, json};
     match v {
@@ -248,10 +187,6 @@ fn annotate_indices(v: &serde_json::Value) -> serde_json::Value {
     }
 }
 
-// ------------------------------------------------------------- calibration
-
-/// 1 - normalised entropy (official certainty): 1 when all mass sits on one
-/// option, 0 when the distribution is flat.
 pub fn certainty(p: &[f64]) -> f64 {
     if p.len() <= 1 {
         return 1.0;
@@ -262,12 +197,10 @@ pub fn certainty(p: &[f64]) -> f64 {
         .sum();
     (1.0 - h / (p.len() as f64).ln()).max(0.0)
 }
-
 fn clip01(x: f64) -> f64 {
     x.clamp(0.0, 1.0)
 }
 
-/// A zero-sum distribution counts as uniform (official _normalised).
 fn normalised(p: &[f64]) -> Vec<f64> {
     let tot: f64 = p.iter().sum();
     if tot == 0.0 {
@@ -276,8 +209,6 @@ fn normalised(p: &[f64]) -> Vec<f64> {
     p.iter().map(|x| x / tot).collect()
 }
 
-/// Margin confidence (official choice_confidence): the largest probability
-/// rescaled so uniform gives 0 and all-on-one gives 1; 1 for one option.
 pub fn choice_confidence(p: &[f64]) -> f64 {
     let n = p.len();
     if n <= 1 {
@@ -288,9 +219,6 @@ pub fn choice_confidence(p: &[f64]) -> f64 {
     clip01((n as f64 * p_max - 1.0) / (n as f64 - 1.0))
 }
 
-/// Score confidence (official score_confidence): 1 minus the expected
-/// distance from the most likely level over the mean distance of the levels
-/// from the scale's middle, floored at 0.
 pub fn score_confidence(p: &[f64]) -> f64 {
     let n = p.len();
     if n <= 1 {
@@ -310,8 +238,6 @@ pub fn score_confidence(p: &[f64]) -> f64 {
     clip01(1.0 - spread / uniform)
 }
 
-/// The official format_answer renormalisation: `sum(p) or 1.0` -- a zero-sum
-/// vector stays zero, matching the official renormalisation exactly.
 fn renormalised(p: &[f64]) -> Vec<f64> {
     let s = p.iter().sum::<f64>();
     if s == 0.0 {
@@ -320,9 +246,6 @@ fn renormalised(p: &[f64]) -> Vec<f64> {
     p.iter().map(|x| x / s).collect()
 }
 
-/// Full calibration: per-row softmax at the answer type's temperature, then
-/// the official assembly. `logits` is the row concatenation (a score request
-/// carries one [no, yes] pair per level; choice/noul a single row).
 pub fn calibrate(
     task: &str,
     logits: &[f64],
@@ -339,12 +262,7 @@ pub fn calibrate(
                 !logits.is_empty() && logits.len().is_multiple_of(2),
                 "letter score rows are [no, yes] pairs"
             );
-            // as_chunks would silently DROP an odd tail; the assert above
-            // keeps that from ever happening.
             let pairs: Vec<[f64; 2]> = logits.as_chunks::<2>().0.to_vec();
-            // P(yes) per isolated level row, then the levels' masses
-            // normalise into the answer distribution (combine_isolated; the
-            // zero-sum sentinel is 1e-9, so p stays ~0 and fit_mass ~0).
             let fit: Vec<f64> = pairs
                 .iter()
                 .map(|[no, yes]| {
@@ -404,7 +322,6 @@ pub fn calibrate(
         }
     }
 }
-
 pub fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }

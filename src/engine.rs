@@ -1,75 +1,63 @@
-//! Engine abstraction: the seam behind the scheduler; OrtEngine (CPU + CUDA
-//! execution providers) is the real implementation, StubEngine the test fake.
-//!
-//! `infer` is deliberately SYNCHRONOUS (a deviation from the usual
-//! `#[async_trait] async fn infer` sketch): inference is blocking CPU/GPU work
-//! that the scheduler already runs inside `spawn_blocking` (invariant 5), a
-//! sync method keeps the trait dyn-safe without the async-trait dependency,
-//! and `health()` is a real liveness probe, never a static "ok".
-
+use crate::replay::ReplayEngine;
+use crate::scheduler::{BatchRunner, CollatedBatch};
+use ndarray::{Array1, Array2, Array4};
+use ort::session::Session;
 use std::hash::{DefaultHasher, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ndarray::{Array1, Array2, Array4};
-use ort::session::Session;
-
-use crate::replay::ReplayEngine;
-use crate::scheduler::{BatchRunner, CollatedBatch};
-
-/// Engine failure; the scheduler fans it out to every responder in the batch.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct EngineError(pub String);
 
-pub trait Engine: Send + Sync {
-    /// Blocking batch inference. Contract: one row per input row, in batch
-    /// order, each at least that row's real_k long (the marker dialects pad
-    /// to the batch K with the -1e4 sentinel; the letter dialect returns the
-    /// 255-wide letter row, sentineled beyond nopts); the scheduler trims
-    /// every row to its request's real_k.
-    fn infer(&self, batch: CollatedBatch) -> Result<Vec<Vec<f64>>, EngineError>;
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineRow {
+    pub logits: Vec<f64>,
+    pub expanded_len: Option<u32>,
+}
 
-    /// Liveness probe surfaced through /health.
+fn plain_rows(rows: Vec<Vec<f64>>) -> Vec<EngineRow> {
+    rows.into_iter()
+        .map(|logits| EngineRow {
+            logits,
+            expanded_len: None,
+        })
+        .collect()
+}
+pub trait Engine: Send + Sync {
+    fn infer(&self, batch: CollatedBatch) -> Result<Vec<EngineRow>, EngineError>;
+
+    fn media_capable(&self) -> bool {
+        false
+    }
+
     fn health(&self) -> bool;
 }
 
-/// Adapt any Engine into the scheduler's BatchRunner.
 pub fn engine_runner(engine: Arc<dyn Engine>) -> BatchRunner {
     Arc::new(move |batch| engine.infer(batch).map_err(|err| err.0))
 }
 
-// ---------------------------------------------------------------- StubEngine
-
-/// Deterministic fake engine: scores are a pure function of the row's token
-/// ids (std DefaultHasher is documented deterministic), plus an optional
-/// simulated latency. Production wires OrtEngine behind the same
-/// `Arc<dyn Engine>` seam.
 pub struct StubEngine {
     latency: Duration,
 }
-
 impl StubEngine {
     pub fn new(latency: Duration) -> Self {
         Self { latency }
     }
 }
 
-/// Deterministic pseudo-score in [-3, 3] from a row seed and marker index.
-/// All integer math is wrapping: the second constant is ~1.38e19, so a plain
-/// `j * CONST` overflows u64 for j >= 2.
 fn stub_score(seed: u64, j: usize) -> f64 {
     let h = seed
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .wrapping_add((j as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
     (h >> 33) as f64 / u32::MAX as f64 * 6.0 - 3.0
 }
-
 impl Engine for StubEngine {
-    fn infer(&self, batch: CollatedBatch) -> Result<Vec<Vec<f64>>, EngineError> {
+    fn infer(&self, batch: CollatedBatch) -> Result<Vec<EngineRow>, EngineError> {
         if !self.latency.is_zero() {
-            std::thread::sleep(self.latency); // runs on the blocking pool
+            std::thread::sleep(self.latency);
         }
         let mut rows = Vec::with_capacity(batch.b);
         for (i, meta) in batch.rows.iter().enumerate() {
@@ -79,31 +67,17 @@ impl Engine for StubEngine {
                 hasher.write_i64(*id);
             }
             let seed = hasher.finish();
-            // Graph-style row: real scores then -1e4 sentinels up to the row
-            // width (batch max K for the marker dialects; a letter row is its
-            // own option count -- resize never SHRINKS below real_k).
             let mut row: Vec<f64> = (0..meta.real_k).map(|j| stub_score(seed, j)).collect();
             row.resize(meta.real_k.max(batch.k), -1e4);
             rows.push(row);
         }
-        Ok(rows)
+        Ok(plain_rows(rows))
     }
-
     fn health(&self) -> bool {
         true
     }
 }
 
-// ---------------------------------------------------------------- OrtEngine
-
-/// Resolve the onnxruntime shared library for the load-dynamic strategy
-/// (ort rc.13 has no programmatic loader; it reads ORT_DYLIB_PATH lazily on
-/// the first API call). Priority: an already-set ORT_DYLIB_PATH (the caller's
-/// explicit choice wins) > MODEL_DIR/lib/ > the executable's directory.
-/// Returns the path to set, or None when the env var is already set.
-///
-/// The caller must apply it with `set_var` BEFORE the first ort call and,
-/// because set_var races concurrent getenv, before spawning threads.
 pub fn resolve_dylib(model_dir: &Path) -> Option<PathBuf> {
     if std::env::var_os("ORT_DYLIB_PATH").is_some() {
         return None;
@@ -115,7 +89,6 @@ pub fn resolve_dylib(model_dir: &Path) -> Option<PathBuf> {
             .flatten()
     })
 }
-
 fn find_dylib(dir: &Path) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
@@ -138,25 +111,16 @@ fn find_dylib(dir: &Path) -> Option<PathBuf> {
                 && (ext == "dylib" || ext == "so" || (cfg!(target_os = "windows") && ext == "dll"))
         })
         .collect();
-    // Prefer the shortest name: plain libonnxruntime.dylib over versioned copies.
     candidates.sort_by_key(|p| p.file_name().map(|n| n.len()).unwrap_or(usize::MAX));
     candidates.into_iter().next()
 }
 
-/// Execution device for the ort engine (engine-level mirror of the CLI flag).
-/// `Cuda` registers the CUDA EP but does not guarantee it is *used*: ORT
-/// places graph nodes at session load and silently keeps them on CPU when the
-/// CUDA provider cannot initialize (no driver, no device, provider library
-/// missing); `ORT_LOG=verbose` surfaces the placement ("All nodes placed on
-/// [...]"). A real dual-EP check requires GPU hardware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceKind {
     Cpu,
     Cuda,
 }
-
 impl DeviceKind {
-    /// The spelling the CLI flag accepts, so logs and flags agree.
     pub fn name(self) -> &'static str {
         match self {
             DeviceKind::Cpu => "cpu",
@@ -165,64 +129,30 @@ impl DeviceKind {
     }
 }
 
-/// The real inference engine: onnxruntime, model loaded from
-/// MODEL_DIR/`<graph from model.json>` (external weights resolve relative
-/// to it). CPU EP is onnxruntime's default; `DeviceKind::Cuda` appends the
-/// CUDA provider.
-///
-/// `Session::run` needs `&mut self`, so the session sits behind a Mutex; the
-/// engine only ever runs inside `spawn_blocking` and the scheduler drives it
-/// sequentially, so in practice the lock is uncontended (the overlap design
-/// still serializes engine calls -- it overlaps COLLATION, not execution).
 pub struct OrtEngine {
-    /// (served length, session). Fixed-shape manifests (`fixed_shapes`)
-    /// load one static-S session per class, ascending; the collate pads
-    /// every batch to a class length and infer picks the matching session.
-    /// Dynamic manifests load a single (0, session) serving every length.
     sessions: Vec<(usize, Mutex<Session>)>,
     #[allow(dead_code)]
     model_path: PathBuf,
-    /// Which input dialect the graph speaks (per the manifest's family).
+
     dialect: crate::family::Family,
-    /// Half-window for the independent-options sliding mask (0 = none).
+
     sliding_window: usize,
 }
-
 impl OrtEngine {
     pub fn new(model_dir: &Path) -> Result<Self, EngineError> {
         Self::with_device(model_dir, DeviceKind::Cpu)
     }
-
     pub fn with_device(model_dir: &Path, device: DeviceKind) -> Result<Self, EngineError> {
         Self::with_device_and_threads(model_dir, device, 0)
     }
 
-    /// `intra_threads = 0` keeps ORT's default (one pool spanning all cores --
-    /// right for a single session). A data-parallel pool passes cores/N per
-    /// replica: N sessions each defaulting their own pool oversubscribe the
-    /// host N-fold and scale throughput DOWN with N; partitioning the cores
-    /// restores the concurrent-sessions shape.
     pub fn with_device_and_threads(
         model_dir: &Path,
         device: DeviceKind,
         intra_threads: usize,
     ) -> Result<Self, EngineError> {
-        // The graph file name and input dialect are model-family data read
-        // from the manifest -- never hardcode a family's file name.
-        let manifest_path = model_dir.join("model.json");
-        let manifest_raw = std::fs::read_to_string(&manifest_path).map_err(|source| {
-            EngineError(format!(
-                "failed to read {}: {source}",
-                manifest_path.display()
-            ))
-        })?;
-        let manifest = serde_json::from_str::<serde_json::Value>(&manifest_raw)
-            .map_err(|source| EngineError(format!("invalid model.json: {source}")))?;
-        // Fixed-shape classes (letter family): {"192": "file.onnx", ...}.
-        // Present => one static-S session per class: the dynamic-S loop graph
-        // computes divergent shapes under the CUDA EP, static-S graphs do not.
-        // Absent => the single
-        // dynamic 'graph' serves every length (marker families).
+        let manifest = crate::manifest::read_manifest(model_dir)
+            .map_err(|err| EngineError(err.to_string()))?;
         let mut fixed: Vec<(usize, String)> = match manifest.get("fixed_shapes") {
             Some(v) => {
                 let obj = v.as_object().ok_or_else(|| {
@@ -261,9 +191,6 @@ impl OrtEngine {
             ));
         }
         let family = crate::family::Family::from_manifest(&manifest).map_err(EngineError)?;
-        // The sliding half-window is family data the mask builder reads; a
-        // missing key would silently collapse the sliding mask to the
-        // diagonal, so it must fail loudly for the family that needs it.
         let sliding_window = manifest.get("sliding_window").and_then(|v| v.as_u64());
         let sliding_window = match (family, sliding_window) {
             (crate::family::Family::IndependentOptions, Some(v)) => v as usize,
@@ -277,8 +204,6 @@ impl OrtEngine {
             (_, Some(v)) => v as usize,
             (_, None) => 0,
         };
-        // A SessionBuilder is consumed by commit, so every graph (the single
-        // dynamic one or each fixed-shape class) builds its own.
         let build_session = |file: &str| -> Result<Session, EngineError> {
             let builder = Session::builder().map_err(|err| EngineError(err.to_string()))?;
             let builder = if intra_threads > 0 {
@@ -290,30 +215,13 @@ impl OrtEngine {
             };
             let mut builder = match device {
                 DeviceKind::Cpu => builder,
-                // fp32 stays the compute dtype (golden discipline; fp16 would need
-                // its own tolerance case). TF32 must be OFF: ORT's
-                // CUDA EP enables it by default (`use_tf32 = 1`), which silently
-                // rounds fp32 matmul inputs to a 10-bit mantissa on Ampere+ --
-                // ~1e-3-scale drift, far beyond the logits tolerance the golden comparison allows.
-                // Turing and older have no TF32 hardware and ignore the flag.
                 DeviceKind::Cuda => builder
                     .with_execution_providers([ort::execution_providers::CUDA::default()
                         .with_tf32(false)
-                        // The default kNextPowerOfTwo arena doubling priced a
-                        // 34MB activation buffer as 64MB+ at every growth step,
-                        // which can exhaust GPU memory on long fp32 activations
-                        // (BFCArena alloc failures). SameAsRequested keeps the
-                        // arena to what the shapes actually need.
                         .with_arena_extend_strategy(
                             ort::execution_providers::ArenaExtendStrategy::SameAsRequested,
                         )
                         .build()
-                        // ort's default is fail_silently: a CUDA EP whose
-                        // libraries fail to load (e.g. a cuBLAS/cuDNN of the
-                        // wrong CUDA generation on LD_LIBRARY_PATH) is dropped
-                        // and every node silently lands on CPU -- the server
-                        // "works" at CPU speed with no error anywhere.
-                        // Removing this flag reintroduces that silent fallback.
                         .error_on_failure()])
                     .map_err(|err| {
                         EngineError(format!(
@@ -332,10 +240,6 @@ impl OrtEngine {
                 )));
             }
             builder.commit_from_file(&model_path).map_err(|err| {
-                // cudaError 35 = the host driver is older than the CUDA stack the
-                // dylib was built for (observed: cu13 image on a 570 driver). The
-                // generic dylib hint below is wrong for that case, so say the
-                // real thing first.
                 let msg = err.to_string();
                 if msg.contains("driver version is insufficient")
                     || msg.contains("CUDA failure 35")
@@ -353,7 +257,6 @@ impl OrtEngine {
                 }
             })
         };
-
         let (sessions, model_path) = if fixed.is_empty() {
             let g = graph.expect("presence checked above");
             let session = build_session(&g)?;
@@ -374,9 +277,8 @@ impl OrtEngine {
         })
     }
 }
-
 impl Engine for OrtEngine {
-    fn infer(&self, batch: CollatedBatch) -> Result<Vec<Vec<f64>>, EngineError> {
+    fn infer(&self, batch: CollatedBatch) -> Result<Vec<EngineRow>, EngineError> {
         let (b, l, k) = (batch.b, batch.l, batch.k);
         if b == 0 {
             return Ok(Vec::new());
@@ -386,29 +288,25 @@ impl Engine for OrtEngine {
                 "internal tensor shape mismatch building {what} ({b}x{l}/{k})"
             ))
         };
-        // Borrow-only preprocessing first: the mask builders read the batch
-        // before the flat buffers move into their tensors.
         let von_tensors = match self.dialect {
             crate::family::Family::IndependentOptions => Some(
                 independent_options_tensors(&batch, b, l, k, self.sliding_window)
                     .map_err(EngineError)?,
             ),
             crate::family::Family::MarkerHead => None,
-            crate::family::Family::LetterReadout => None,
+            crate::family::Family::LetterReadout | crate::family::Family::LetterBranches => None,
         };
-        let letter_mask = (self.dialect == crate::family::Family::LetterReadout)
-            .then(|| letter_causal_mask(&batch, b, l));
+        let letter_mask = matches!(
+            self.dialect,
+            crate::family::Family::LetterReadout | crate::family::Family::LetterBranches
+        )
+        .then(|| letter_causal_mask(&batch, b, l));
         let ids =
             Array2::from_shape_vec((b, l), batch.input_ids).map_err(|_| shape_err("input_ids"))?;
         let marker_pos = Array2::from_shape_vec((b, k), batch.marker_pos)
             .map_err(|_| shape_err("marker_pos"))?;
         let marker_mask = Array2::from_shape_vec((b, k), batch.marker_mask)
             .map_err(|_| shape_err("marker_mask"))?;
-
-        // Fixed-shape manifests pick the session by padded length; a length
-        // matching no class means a request exceeded the largest served
-        // shape (the collate leaves such batches at their own length) --
-        // fail the batch loudly instead of running a wrong-shape session.
         let mut session = if self.sessions.len() == 1 {
             self.sessions[0]
                 .1
@@ -517,7 +415,7 @@ impl Engine for OrtEngine {
                     .run(inputs)
                     .map_err(|e| EngineError(format!("inference failed: {e}")))?
             }
-            crate::family::Family::LetterReadout => {
+            crate::family::Family::LetterReadout | crate::family::Family::LetterBranches => {
                 if k != 1 || batch.nopts.len() != b {
                     return Err(shape_err("letter slots (exactly one slot per row)"));
                 }
@@ -566,10 +464,6 @@ impl Engine for OrtEngine {
                 let (_, logits) = outputs["logits"]
                     .try_extract_tensor::<f32>()
                     .map_err(|e| EngineError(format!("failed to read logits output: {e}")))?;
-                // (N, LETTER_WIDTH): N = one slot per request, slots are in
-                // request order, so row i belongs to request i. Rows stay
-                // full width -- the graph fills >= nopts with the -1e4
-                // sentinel and the scheduler trims to each request's nopts.
                 const LETTER_WIDTH: usize = 255;
                 if logits.len() != b * LETTER_WIDTH {
                     return Err(EngineError(format!(
@@ -578,17 +472,18 @@ impl Engine for OrtEngine {
                         b
                     )));
                 }
-                return Ok((0..b)
-                    .map(|i| {
-                        logits[i * LETTER_WIDTH..(i + 1) * LETTER_WIDTH]
-                            .iter()
-                            .map(|v| *v as f64)
-                            .collect()
-                    })
-                    .collect());
+                return Ok(plain_rows(
+                    (0..b)
+                        .map(|i| {
+                            logits[i * LETTER_WIDTH..(i + 1) * LETTER_WIDTH]
+                                .iter()
+                                .map(|v| *v as f64)
+                                .collect::<Vec<f64>>()
+                        })
+                        .collect::<Vec<_>>(),
+                ));
             }
         };
-        // act_probs [B,2] is intentionally not read (semantics unpinned).
         let (_, logits) = outputs["logits"]
             .try_extract_tensor::<f32>()
             .map_err(|e| EngineError(format!("failed to read logits output: {e}")))?;
@@ -598,35 +493,24 @@ impl Engine for OrtEngine {
                 logits.len()
             )));
         }
-        // Graph-style rows of length k (masked slots hold the -1e4 sentinel);
-        // the scheduler trims to each request's real_k.
-        Ok((0..b)
-            .map(|i| {
-                logits[i * k..(i + 1) * k]
-                    .iter()
-                    .map(|v| *v as f64)
-                    .collect()
-            })
-            .collect())
+        Ok(plain_rows(
+            (0..b)
+                .map(|i| {
+                    logits[i * k..(i + 1) * k]
+                        .iter()
+                        .map(|v| *v as f64)
+                        .collect::<Vec<f64>>()
+                })
+                .collect::<Vec<_>>(),
+        ))
     }
-
     fn health(&self) -> bool {
-        // A constructed session is alive; health is a liveness signal for the constructed engine.
         true
     }
 }
 
-/// The independent-options graph's derived tensors: position ids and the two
-/// additive 4D attention masks.
 type VonTensors = (Array2<i64>, Array4<f32>, Array4<f32>);
 
-/// The letter-readout graph's additive 4D causal mask (0 where allowed,
-/// f32::MIN where blocked): allowed = key <= query AND the key is a real
-/// (non-padded) position -- causal and right-padding merged, exactly the
-/// eager_mask the graph was exported and probed against. Pad QUERY rows keep
-/// the causal pattern (nothing reads their outputs, and no fully-masked row
-/// ever reaches a softmax). Cost is O(B * S^2) f32 -- B x S x S x 4 bytes of
-/// tensor, the shape to keep in mind when sizing batches of long rows.
 fn letter_causal_mask(batch: &CollatedBatch, b: usize, l: usize) -> Array4<f32> {
     let mut mask = Array4::<f32>::from_elem((b, 1, l, l), f32::MIN);
     for row in 0..b {
@@ -640,15 +524,6 @@ fn letter_causal_mask(batch: &CollatedBatch, b: usize, l: usize) -> Array4<f32> 
     mask
 }
 
-/// Build the independent-options graph inputs (position ids + the two
-/// additive 4D masks) from the collated batch, re-typed from the official
-/// build_independent_option_masks / build_option_invariant_position_ids.
-/// The block structure is fully determined by (marker positions, real
-/// length): the premise is everything before the first marker PLUS the
-/// trailing separator (the last real position); option j spans
-/// [marker_j, marker_{j+1}), the final span ending before that trailing
-/// separator. Padded key columns are blocked; the diagonal always attends
-/// (a fully-masked row would NaN the softmax).
 fn independent_options_tensors(
     batch: &CollatedBatch,
     b: usize,
@@ -659,8 +534,6 @@ fn independent_options_tensors(
     let mut position = Array2::<i64>::from_shape_fn((b, l), |(_row, col)| col as i64);
     let mut full = Array4::<f32>::zeros((b, 1, l, l));
     let mut sliding = Array4::<f32>::zeros((b, 1, l, l));
-    // torch.finfo(f32).min: the additive-blocked value (softmax sends it to
-    // exactly zero without NaN).
     const NEG: f32 = f32::MIN;
     for row in 0..b {
         let real_len = batch.rows[row].real_len;
@@ -676,7 +549,6 @@ fn independent_options_tensors(
         let prefix_len = markers[0];
         let mut option_id = vec![-1i64; l];
         for (j, &start) in markers.iter().enumerate() {
-            // The last option ends before the trailing separator.
             let end = markers
                 .get(j + 1)
                 .copied()
@@ -713,30 +585,22 @@ fn independent_options_tensors(
     Ok((position, full, sliding))
 }
 
-// ------------------------------------------------------- ReplayEngine adapter
-
-/// Wraps the golden ReplayEngine as an Engine: CI grades the full HTTP stack
-/// without model weights (the end-to-end protocol grading layer). Rows are unpadded with
-/// their real lengths before the lookup (golden keys are unpadded sequences).
 pub struct ReplayEngineAdapter {
     replay: Arc<ReplayEngine>,
     latency: Duration,
 }
-
 impl ReplayEngineAdapter {
     pub fn new(replay: Arc<ReplayEngine>, latency: Duration) -> Self {
         Self { replay, latency }
     }
 }
-
 impl Engine for ReplayEngineAdapter {
-    fn infer(&self, batch: CollatedBatch) -> Result<Vec<Vec<f64>>, EngineError> {
+    fn infer(&self, batch: CollatedBatch) -> Result<Vec<EngineRow>, EngineError> {
         if !self.latency.is_zero() {
             std::thread::sleep(self.latency);
         }
         let mut rows = Vec::with_capacity(batch.b);
         for (i, meta) in batch.rows.iter().enumerate() {
-            // Collated ids are i64 (graph tensors); golden keys are u32.
             let real_ids: Vec<u32> = batch.input_ids[i * batch.l..i * batch.l + meta.real_len]
                 .iter()
                 .map(|id| *id as u32)
@@ -747,14 +611,17 @@ impl Engine for ReplayEngineAdapter {
                 ))
             })?;
             let mut row = logits.to_vec();
-            // Pad to the row width, never shrink below a request's real_k
-            // (the letter dialect's rows are wider than the batch K).
             row.resize(meta.real_k.max(batch.k), -1e4);
-            rows.push(row);
+            rows.push(EngineRow {
+                logits: row,
+                expanded_len: self.replay.expanded_len(&real_ids),
+            });
         }
         Ok(rows)
     }
-
+    fn media_capable(&self) -> bool {
+        self.replay.media_capable()
+    }
     fn health(&self) -> bool {
         !self.replay.is_empty()
     }

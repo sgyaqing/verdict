@@ -1,38 +1,12 @@
-//! Model acquisition: a model source is either a local directory or a
-//! Hugging Face repo id (`<org>/<name>`) holding a verdict-ready layout
-//! (model.json + the graph it names + tokenizer/tokenizer.json). Repo ids
-//! auto-download into a cache and re-runs hit it -- the vLLM `serve <model>`
-//! habit.
-//!
-//! Backends: the Hugging Face Hub (default; `HF_ENDPOINT` switches to an
-//! alternate endpoint, `HF_TOKEN` authenticates gated
-//! repos) and ModelScope (`VERDICT_USE_MODELSCOPE=1`;
-//! `MODELSCOPE_API_TOKEN` for auth). Both hubs download through one shared
-//! stall-guarded downloader (per-read timeout, bounded retries, atomic
-//! `<file>.part` -> rename). Verdict never converts models (verdict-ready
-//! repos are produced offline, GGUF-style), so the hub side is download-only.
-//!
-//! What differs between the hubs is URL shape, default branch name and auth
-//! variable -- nothing about what a package IS. All of it lives in [`Hub`],
-//! and the package fetch is written once against it, so a repo of the same
-//! name behaves the same on either hub. Both cache to `<cache>/<org>/<name>`
-//! (`$VERDICT_CACHE` overrides the root) -- one directory per model, not per
-//! hub -- and neither consults the hub's own cache: the hubs hold upstream
-//! repos, whose layout is not ours.
-
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// Which hub a repo id resolves against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HubBackend {
     Hf,
     ModelScope,
 }
-
 impl HubBackend {
-    /// `VERDICT_USE_MODELSCOPE=1|true` selects ModelScope (vLLM's
-    /// `VLLM_USE_MODELSCOPE` pattern).
     pub fn from_env() -> Self {
         match std::env::var("VERDICT_USE_MODELSCOPE").as_deref() {
             Ok("1") | Ok("true") => HubBackend::ModelScope,
@@ -41,31 +15,19 @@ impl HubBackend {
     }
 }
 
-/// Everything the two hubs do differently, in one place: URL shape, default
-/// branch name, auth variable, cache layout, and how a missing file reports
-/// itself. The package fetch is written ONCE against this. A per-backend
-/// split drifts: one hub silently ends up without a package shape the other
-/// supports.
 #[derive(Debug, Clone)]
 pub struct Hub {
     backend: HubBackend,
-    /// Base URL, no trailing slash. For ModelScope the `/models` prefix is
-    /// part of the base, not of the file path.
+
     endpoint: String,
     bearer: Option<String>,
-    /// `--force-download`: re-fetch every file and ignore the completion
-    /// marker, so an updated or name-colliding upstream package is picked up.
-    /// Named after `huggingface_hub`'s `force_download`, which transformers and
-    /// vLLM carry too; ModelScope spells the same thing `--force`.
+
     force: bool,
 }
-
 impl Hub {
     pub fn for_backend(backend: HubBackend) -> Self {
         match backend {
             HubBackend::Hf => {
-                // HF_ENDPOINT switches the whole path to an alternate
-                // endpoint; HF_TOKEN authenticates gated repos.
                 let endpoint = std::env::var("HF_ENDPOINT")
                     .ok()
                     .map(|e| e.trim_end_matches('/').to_owned())
@@ -86,8 +48,6 @@ impl Hub {
         }
     }
 
-    /// An explicitly addressed hub, for a caller the environment does not
-    /// name -- tests point this at a throwaway local server.
     pub fn with_endpoint(
         backend: HubBackend,
         endpoint: impl Into<String>,
@@ -101,19 +61,14 @@ impl Hub {
         }
     }
 
-    /// `--force-download`.
     pub fn forced(mut self, on: bool) -> Self {
         self.force = on;
         self
     }
-
     pub fn backend(&self) -> HubBackend {
         self.backend
     }
 
-    /// The branch a file resolves to when the manifest pins no revision. The
-    /// two hubs name their default branch differently, which is why the pin
-    /// is optional: one manifest has to serve both.
     pub fn default_branch(&self) -> &'static str {
         match self.backend {
             HubBackend::Hf => "main",
@@ -121,7 +76,6 @@ impl Hub {
         }
     }
 
-    /// The name to use in a message the user reads.
     fn display(&self) -> &'static str {
         match self.backend {
             HubBackend::Hf => "Hugging Face",
@@ -129,7 +83,6 @@ impl Hub {
         }
     }
 
-    /// The name to use in a log field.
     fn slug(&self) -> &'static str {
         match self.backend {
             HubBackend::Hf => "huggingface",
@@ -137,8 +90,6 @@ impl Hub {
         }
     }
 
-    /// What to add when the manifest itself could not be fetched -- the two
-    /// hubs fail for different reasons and the fix differs.
     fn manifest_hint(&self) -> &'static str {
         match self.backend {
             HubBackend::Hf => "is this a verdict-ready repo? see the README model section",
@@ -146,14 +97,6 @@ impl Hub {
         }
     }
 
-    /// What to add when the official weights could not be fetched.
-    ///
-    /// The manifest names the checkpoint as it is on HUGGING FACE; on
-    /// ModelScope the same id is asked for. Vendors do not always mirror their
-    /// repo there under that name, and when they do not, nothing on our side
-    /// can fix it -- so the message has to tell the user which repo is being
-    /// looked for where, and what to do instead. Reporting it to the package
-    /// maintainer would be the wrong advice for that case.
     fn checkpoint_hint(&self, repo: &str) -> String {
         match self.backend {
             HubBackend::Hf => format!(
@@ -167,31 +110,17 @@ impl Hub {
             ),
         }
     }
-
     fn file_url(&self, repo_id: &str, revision: &str, path: &str) -> String {
         format!("{}/{repo_id}/resolve/{revision}/{path}", self.endpoint)
     }
 
-    /// Where this repo's files land: `<cache>/<org>/<name>`.
-    ///
-    /// Keyed by repo id alone, NOT by hub: the two hubs are held to the same
-    /// content (an operational rule, not an assumption this code can check), so
-    /// the same repo id names one artifact however it is fetched. A repo that
-    /// exists on only one hub is unaffected either way.
     fn cache_dir(&self, repo_id: &str) -> PathBuf {
-        // The model NAME, not the repo id: the two hubs are held to the same
-        // content (an operational rule), so `verdict-models/von` on one and
-        // `example-org/von` on the other are one artifact and must share a slot.
-        // Two DIFFERENT repos that happen to share a name would collide -- a
-        // refresh/override flag is the escape hatch, and is not built yet.
         let (_, name) = repo_id
             .split_once('/')
             .expect("is_repo_id guarantees one slash");
         verdict_cache_root().join(name)
     }
 
-    /// Cache-first fetch of one file through the shared stall-guarded
-    /// downloader. An already-present file is a hit and touches no network.
     pub fn get(
         &self,
         repo_id: &str,
@@ -206,9 +135,6 @@ impl Hub {
         let url = self.file_url(repo_id, revision, path);
         match http_download_auth(&url, &dest, self.bearer.as_deref()) {
             Ok(()) => Ok(dest),
-            // ModelScope answers a missing file with HTTP 500, not 404.
-            // 500 stays retryable at the http_download
-            // layer; here a 500 that survived every retry is "absent".
             Err(err) if self.backend == HubBackend::ModelScope && err.contains("HTTP 500") => {
                 Err(format!(
                     "fetching {path} from {repo_id} on ModelScope: {err} \
@@ -222,9 +148,6 @@ impl Hub {
         }
     }
 
-    /// Optional-file probe: a single attempt, no retries -- ModelScope answers
-    /// an absent file with HTTP 500, and the retry ladder would burn its full
-    /// backoff budget on every first pull of a repo without that file.
     pub fn get_optional(
         &self,
         repo_id: &str,
@@ -243,9 +166,105 @@ impl Hub {
             Err(_) => Err(format!("optional {path} absent")),
         }
     }
+
+    pub fn list_repo_files(&self, repo_id: &str, revision: &str) -> Result<Vec<String>, String> {
+        match self.backend {
+            HubBackend::Hf => self.list_repo_files_hf(repo_id, revision),
+            HubBackend::ModelScope => self.list_repo_files_ms(repo_id, revision),
+        }
+    }
+
+    fn list_repo_files_hf(&self, repo_id: &str, revision: &str) -> Result<Vec<String>, String> {
+        let agent = http_agent();
+        let mut url = format!(
+            "{}/api/models/{repo_id}/tree/{revision}?recursive=true",
+            self.endpoint
+        );
+        let mut out = Vec::new();
+        loop {
+            let mut request = agent.get(&url);
+            if let Some(token) = &self.bearer {
+                request = request.set("Authorization", &format!("Bearer {token}"));
+            }
+            let response = request.call().map_err(|err| {
+                format!("listing files of {repo_id} on {}: {err}", self.display())
+            })?;
+            let link = response.header("Link").map(str::to_owned);
+            let text = response.into_string().map_err(|err| {
+                format!("listing files of {repo_id} on {}: {err}", self.display())
+            })?;
+            let body: serde_json::Value = serde_json::from_str(&text).map_err(|err| {
+                format!("listing files of {repo_id} on {}: {err}", self.display())
+            })?;
+            let entries = body.as_array().ok_or_else(|| {
+                format!(
+                    "listing files of {repo_id} on {}: the tree response is not an array",
+                    self.display()
+                )
+            })?;
+            for entry in entries {
+                if entry.get("type").and_then(|v| v.as_str()) != Some("file") {
+                    continue;
+                }
+                if let Some(path) = entry.get("path").and_then(|v| v.as_str()) {
+                    out.push(path.to_string());
+                }
+            }
+            let next = link.as_deref().and_then(|l| {
+                l.split(',')
+                    .map(str::trim)
+                    .find(|part| part.ends_with("rel=\"next\""))
+                    .and_then(|part| part.split(';').next())
+                    .map(|u| u.trim().trim_matches(|c| c == '<' || c == '>').to_string())
+            });
+            match next {
+                Some(u) if !u.is_empty() => url = u,
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
+
+    fn list_repo_files_ms(&self, repo_id: &str, revision: &str) -> Result<Vec<String>, String> {
+        let base = self
+            .endpoint
+            .strip_suffix("/models")
+            .unwrap_or(&self.endpoint);
+        let url =
+            format!("{base}/api/v1/models/{repo_id}/repo/files?Revision={revision}&Recursive=true");
+        let agent = http_agent();
+        let mut request = agent.get(&url);
+        if let Some(token) = &self.bearer {
+            request = request.set("Authorization", &format!("Bearer {token}"));
+        }
+        let response = request
+            .call()
+            .map_err(|err| format!("listing files of {repo_id} on ModelScope: {err}"))?;
+        let text = response
+            .into_string()
+            .map_err(|err| format!("listing files of {repo_id} on ModelScope: {err}"))?;
+        let body: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|err| format!("listing files of {repo_id} on ModelScope: {err}"))?;
+        let files = body
+            .get("Data")
+            .and_then(|d| d.get("Files"))
+            .and_then(|f| f.as_array())
+            .ok_or_else(|| {
+                format!("listing files of {repo_id} on ModelScope: no Data.Files array")
+            })?;
+        let mut out = Vec::new();
+        for entry in files {
+            if entry.get("Type").and_then(|v| v.as_str()) != Some("blob") {
+                continue;
+            }
+            if let Some(path) = entry.get("Path").and_then(|v| v.as_str()) {
+                out.push(path.to_string());
+            }
+        }
+        Ok(out)
+    }
 }
 
-/// Does this look like a repo id (`<namespace>/<name>`) rather than a path?
 pub fn is_repo_id(spec: &str) -> bool {
     !spec.is_empty()
         && !spec.starts_with('/')
@@ -256,32 +275,109 @@ pub fn is_repo_id(spec: &str) -> bool {
         && spec.matches('/').count() == 1
 }
 
-/// Resolve a CLI model spec to a local directory: an existing dir wins
-/// as-is; otherwise a repo-shaped id downloads (cache-first) against the
-/// env-selected backend.
+pub const VARIANTS_INDEX: &str = "variants.json";
+
+pub fn split_spec(spec: &str) -> Result<(&str, Option<String>), String> {
+    let Some((head, tag)) = spec.rsplit_once(':') else {
+        return Ok((spec, None));
+    };
+    if head.is_empty() || (!Path::new(head).is_dir() && !is_repo_id(head)) {
+        return Ok((spec, None));
+    }
+    let tag = tag.to_lowercase();
+    if !valid_variant_name(&tag) {
+        return Err(format!(
+            "invalid variant tag in {spec:?} (a tag matches [a-z0-9][a-z0-9._-], up to 64 chars)"
+        ));
+    }
+    Ok((head, Some(tag)))
+}
+fn valid_variant_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn parse_variants_index(raw: &str, source: &str) -> Result<Vec<String>, String> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|err| format!("invalid {VARIANTS_INDEX} in {source}: {err}"))?;
+    let list = value
+        .get("variants")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("{VARIANTS_INDEX} in {source} is missing the 'variants' array"))?;
+    let mut out: Vec<String> = Vec::with_capacity(list.len());
+    for item in list {
+        let name = item.as_str().ok_or_else(|| {
+            format!("{VARIANTS_INDEX} in {source}: variant names must be strings")
+        })?;
+        if !valid_variant_name(name) {
+            return Err(format!(
+                "{VARIANTS_INDEX} in {source}: invalid variant name {name:?} \
+                 ([a-z0-9][a-z0-9._-], up to 64 chars)"
+            ));
+        }
+        if out.iter().any(|seen| seen == name) {
+            return Err(format!(
+                "{VARIANTS_INDEX} in {source}: duplicate variant {name:?}"
+            ));
+        }
+        out.push(name.to_string());
+    }
+    if out.is_empty() {
+        return Err(format!("{VARIANTS_INDEX} in {source}: 'variants' is empty"));
+    }
+    Ok(out)
+}
+
+fn variant_listing(source: &str, variants: &[String], cached: impl Fn(&str) -> bool) -> String {
+    let lines: Vec<String> = variants
+        .iter()
+        .map(|name| {
+            if cached(name) {
+                format!("  {name} (cached)")
+            } else {
+                format!("  {name}")
+            }
+        })
+        .collect();
+    format!(
+        "{source} is a variant family; pick one with {source}:<variant>\n\
+         available:\n{}\n\
+         example: verdict serve {source}:{}",
+        lines.join("\n"),
+        variants[0]
+    )
+}
+
 pub fn resolve(spec: &str) -> Result<PathBuf, String> {
     resolve_backend(spec, HubBackend::from_env())
 }
 
-/// `verdict serve --force-download`: same as [`resolve`], but every file is
-/// re-fetched and the completion marker is ignored, so a package that changed
-/// upstream -- or one sharing its name with a different repo -- is picked up.
 pub fn resolve_forced(spec: &str, force: bool) -> Result<PathBuf, String> {
     resolve_with(spec, HubBackend::from_env(), force)
 }
 
-/// Backend-explicit resolve (tests pass the backend directly).
 pub fn resolve_backend(spec: &str, backend: HubBackend) -> Result<PathBuf, String> {
     resolve_with(spec, backend, false)
 }
-
 fn resolve_with(spec: &str, backend: HubBackend, force: bool) -> Result<PathBuf, String> {
-    let local = Path::new(spec);
+    let (base, tag) = split_spec(spec)?;
+    let local = Path::new(base);
     if local.is_dir() {
-        return Ok(local.to_path_buf());
+        return resolve_local(local, tag.as_deref());
     }
-    if is_repo_id(spec) {
-        return download(&Hub::for_backend(backend).forced(force), spec);
+    if is_repo_id(base) {
+        return download(
+            &Hub::for_backend(backend).forced(force),
+            base,
+            tag.as_deref(),
+        );
     }
     Err(format!(
         "model source {spec:?} is neither an existing directory nor a repo id \
@@ -289,12 +385,61 @@ fn resolve_with(spec: &str, backend: HubBackend, force: bool) -> Result<PathBuf,
     ))
 }
 
-/// The graph file name from a downloaded manifest.
+fn resolve_local(dir: &Path, tag: Option<&str>) -> Result<PathBuf, String> {
+    let has_manifest = dir.join("model.json").is_file();
+    let has_index = dir.join(VARIANTS_INDEX).is_file();
+    match (has_manifest, has_index) {
+        (true, true) => Err(format!(
+            "{} has both model.json and {VARIANTS_INDEX} -- a package is either \
+             plain or a variant family, not both",
+            dir.display()
+        )),
+        (true, false) => match tag {
+            None => Ok(dir.to_path_buf()),
+            Some(v) => Err(format!(
+                "{} has no variants (its model.json is a plain package); \
+                 serve it without :{v}",
+                dir.display()
+            )),
+        },
+        (false, true) => {
+            let index_path = dir.join(VARIANTS_INDEX);
+            let raw = std::fs::read_to_string(&index_path)
+                .map_err(|err| format!("read {}: {err}", index_path.display()))?;
+            let variants = parse_variants_index(&raw, &dir.display().to_string())?;
+            let Some(v) = tag else {
+                return Err(variant_listing(
+                    &dir.display().to_string(),
+                    &variants,
+                    |name| dir.join(name).join(COMPLETE).is_file(),
+                ));
+            };
+            if !variants.iter().any(|name| name == v) {
+                return Err(format!(
+                    "unknown variant {v:?} for {} (available: {})",
+                    dir.display(),
+                    variants.join(", ")
+                ));
+            }
+            let sub = dir.join(v);
+            if !sub.join("model.json").is_file() {
+                return Err(format!(
+                    "variant {v:?} of {} has no model.json in {}",
+                    dir.display(),
+                    sub.display()
+                ));
+            }
+            Ok(sub)
+        }
+        (false, false) => Ok(dir.to_path_buf()),
+    }
+}
+
 fn graph_from_manifest(manifest_path: &Path, repo_id: &str) -> Result<String, String> {
     let raw = std::fs::read_to_string(manifest_path)
         .map_err(|err| format!("cached model.json in {repo_id}: {err}"))?;
-    let manifest: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|err| format!("invalid model.json in {repo_id}: {err}"))?;
+    let manifest = crate::manifest::parse_manifest(&raw)
+        .map_err(|err| format!("{} (model.json in {repo_id})", err))?;
     manifest
         .get("graph")
         .and_then(|v| v.as_str())
@@ -302,75 +447,121 @@ fn graph_from_manifest(manifest_path: &Path, repo_id: &str) -> Result<String, St
         .ok_or_else(|| format!("model.json in {repo_id} is missing the 'graph' field"))
 }
 
-/// Fetch a verdict-ready package from `hub`. Two shapes, decided by the
-/// manifest alone -- not by which hub it came from:
-///
-/// - a graph package ships the ONNX graph it names;
-/// - a checkpoint package (torch runtime) ships only the manifest and fetches
-///   its weights from the official repo it declares.
-///
-/// Every file is fetched through [`Hub::get`], which serves a file already in
-/// our own cache without contacting the hub. A completed package carries a
-/// [`COMPLETE`] marker and short-circuits the whole walk, so a warm start
-/// makes no request at all -- without it the optional `<graph>.data` probe
-/// would ask every time (`<graph>.data` is optional in ONNX, and its absence
-/// from the cache cannot be told from "the repo has none"). The hubs' own
-/// caches are never consulted: a verdict-ready repo is not the upstream repo,
-/// and only the former has the manifest we need.
-pub fn download(hub: &Hub, repo_id: &str) -> Result<PathBuf, String> {
-    // A package's OWN files are always read at the hub's default branch; only
-    // the checkpoint names a revision.
+pub fn download(hub: &Hub, repo_id: &str, variant: Option<&str>) -> Result<PathBuf, String> {
     let dir = hub.cache_dir(repo_id);
-    if dir.join(COMPLETE).is_file() && !hub.force {
+    let branch = hub.default_branch();
+    let warm = match variant {
+        None => dir.clone(),
+        Some(v) => dir.join(v),
+    };
+    if warm.join(COMPLETE).is_file() && !hub.force {
         tracing::info!(
             hub = hub.slug(),
             repo = repo_id,
-            cache = %dir.display(),
+            cache = %warm.display(),
             "serving from the cache; hub not contacted"
         );
-        return Ok(dir);
+        return Ok(warm);
     }
-    let branch = hub.default_branch();
-    // One line when a download actually starts. A warm cache returned above, so
-    // this only prints when the hub is about to be hit.
     tracing::info!(
         hub = hub.slug(),
         repo = repo_id,
+        variant = variant.unwrap_or(""),
         cache = %dir.display(),
         "downloading"
     );
+    if let Ok(manifest_path) = hub.get_optional(repo_id, branch, "model.json", &dir) {
+        if variant.is_some() {
+            return Err(format!(
+                "{repo_id} has no variants (its root model.json is a plain package); \
+                 serve it as {repo_id}"
+            ));
+        }
+        if hub
+            .get_optional(repo_id, branch, VARIANTS_INDEX, &dir)
+            .is_ok()
+        {
+            return Err(format!(
+                "{repo_id} has both model.json and {VARIANTS_INDEX} at its root -- \
+                 a package is either plain or a variant family, not both"
+            ));
+        }
+        fetch_package_body(hub, repo_id, &dir, "", &dir, &manifest_path)?;
+        write_complete(&dir)?;
+        return Ok(dir);
+    }
+    let index_path = hub
+        .get(repo_id, branch, VARIANTS_INDEX, &dir)
+        .map_err(|err| format!("{err} (model.json is absent too; {})", hub.manifest_hint()))?;
+    let index_raw = std::fs::read_to_string(&index_path)
+        .map_err(|err| format!("read {}: {err}", index_path.display()))?;
+    let variants = parse_variants_index(&index_raw, repo_id)?;
+    let Some(v) = variant else {
+        return Err(variant_listing(repo_id, &variants, |name| {
+            dir.join(name).join(COMPLETE).is_file()
+        }));
+    };
+    if !variants.iter().any(|name| name == v) {
+        return Err(format!(
+            "unknown variant {v:?} for {repo_id} (available: {})",
+            variants.join(", ")
+        ));
+    }
+    let vdir = dir.join(v);
+    if hub.force && vdir.exists() {
+        std::fs::remove_dir_all(&vdir)
+            .map_err(|err| format!("resetting {}: {err}", vdir.display()))?;
+    }
+    let prefix = format!("{v}/");
+    let manifest_path = hub.get(repo_id, branch, &format!("{prefix}model.json"), &dir)?;
+    fetch_package_body(hub, repo_id, &dir, &prefix, &vdir, &manifest_path)?;
+    write_complete(&vdir)?;
+    Ok(vdir)
+}
 
-    let manifest_path = hub
-        .get(repo_id, branch, "model.json", &dir)
-        .map_err(|err| format!("{err} ({})", hub.manifest_hint()))?;
-    let manifest_raw = std::fs::read_to_string(&manifest_path)
+fn fetch_package_body(
+    hub: &Hub,
+    repo_id: &str,
+    dir: &Path,
+    prefix: &str,
+    ckpt_dir: &Path,
+    manifest_path: &Path,
+) -> Result<(), String> {
+    let branch = hub.default_branch();
+    let manifest_raw = std::fs::read_to_string(manifest_path)
         .map_err(|err| format!("read {}: {err}", manifest_path.display()))?;
     let manifest: serde_json::Value = serde_json::from_str(&manifest_raw)
         .map_err(|err| format!("invalid model.json in {repo_id}: {err}"))?;
-
     if let Some(decl) = checkpoint_decl(&manifest) {
         let decl = decl.map_err(|err| format!("invalid model.json in {repo_id}: {err}"))?;
-        let tokenizer_path = hub.get(repo_id, branch, "tokenizer/tokenizer.json", &dir)?;
-        fetch_checkpoint(hub, &dir, &decl)?;
+        if decl.files.is_some() {
+            hub.get(
+                repo_id,
+                branch,
+                &format!("{prefix}tokenizer/tokenizer.json"),
+                dir,
+            )?;
+        }
+        fetch_checkpoint(hub, ckpt_dir, &decl)?;
         tracing::info!(
             hub = hub.slug(),
             repo = repo_id,
             checkpoint = %decl.repo,
             revision = %decl.revision_on(hub),
-            cache = %dir.display(),
-            tokenizer = %tokenizer_path.display(),
+            cache = %ckpt_dir.display(),
             "package fetched; weights fetched from the official repo"
         );
-        write_complete(&dir)?;
-        return Ok(dir);
+        return Ok(());
     }
-
-    let graph = graph_from_manifest(&manifest_path, repo_id)?;
-    let graph_path = hub.get(repo_id, branch, &graph, &dir)?;
-    // External weights: fetch `<graph>.data` when present (a miss means none).
-    let _ = hub.get_optional(repo_id, branch, &format!("{graph}.data"), &dir);
-    let tokenizer_path = hub.get(repo_id, branch, "tokenizer/tokenizer.json", &dir)?;
-
+    let graph = graph_from_manifest(manifest_path, repo_id)?;
+    let graph_path = hub.get(repo_id, branch, &format!("{prefix}{graph}"), dir)?;
+    let _ = hub.get_optional(repo_id, branch, &format!("{prefix}{graph}.data"), dir);
+    let tokenizer_path = hub.get(
+        repo_id,
+        branch,
+        &format!("{prefix}tokenizer/tokenizer.json"),
+        dir,
+    )?;
     tracing::info!(
         hub = hub.slug(),
         repo = repo_id,
@@ -379,44 +570,29 @@ pub fn download(hub: &Hub, repo_id: &str) -> Result<PathBuf, String> {
         tokenizer = %tokenizer_path.display(),
         "model fetched"
     );
-    write_complete(&dir)?;
-    Ok(dir)
+    Ok(())
 }
 
-/// Marker file in a package directory: every file this package needs is here.
-/// Written LAST, so a run killed mid-fetch leaves it absent and the next start
-/// resumes file by file. Its presence is the only completeness claim we make --
-/// delete it to force a re-check against the hub.
 const COMPLETE: &str = ".complete";
-
 fn write_complete(dir: &Path) -> Result<(), String> {
     std::fs::write(dir.join(COMPLETE), b"")
         .map_err(|err| format!("marking {} complete: {err}", dir.display()))
 }
 
-/// A manifest's checkpoint declaration: weights that live in an OFFICIAL repo
-/// (the packager names the repo and the exact file list; the package itself
-/// ships only manifest/tokenizer/checksums, so no model weights are
-/// redistributed by us).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointDecl {
     pub repo: String,
-    /// The revision the packager pinned, if any. `None` means the hub's own
-    /// default branch, which is what lets one manifest serve both hubs: HF
-    /// has no branch by that name on ModelScope and vice versa.
-    pub revision: Option<String>,
-    pub files: Vec<String>,
-}
 
+    pub revision: Option<String>,
+
+    pub files: Option<Vec<String>>,
+}
 impl CheckpointDecl {
-    /// The revision to fetch at, on this hub.
     pub fn revision_on(&self, hub: &Hub) -> &str {
         self.revision.as_deref().unwrap_or(hub.default_branch())
     }
 }
 
-/// Parse the `"checkpoint"` field of a model manifest. Present = a
-/// torch-runtime package whose weights must be fetched beside model.json.
 pub fn checkpoint_decl(manifest: &serde_json::Value) -> Option<Result<CheckpointDecl, String>> {
     let decl = manifest.get("checkpoint")?;
     let bad = |msg: String| Some(Err(msg));
@@ -424,7 +600,7 @@ pub fn checkpoint_decl(manifest: &serde_json::Value) -> Option<Result<Checkpoint
         Some(o) => o,
         None => {
             return bad(
-                "model.json 'checkpoint' must be an object: {\"repo\", \"files\" \
+                "model.json 'checkpoint' must be an object: {\"repo\" [, \"files\"] \
                  [, \"revision\"]}"
                     .to_string(),
             );
@@ -438,8 +614,6 @@ pub fn checkpoint_decl(manifest: &serde_json::Value) -> Option<Result<Checkpoint
         None | Some(serde_json::Value::Null) => None,
         Some(v) => match v.as_str() {
             Some(r) if !r.is_empty() => Some(r.to_string()),
-            // An empty or non-string revision would silently become
-            // `resolve//<path>` and 404 -- refuse it here instead.
             _ => {
                 return bad(
                     "model.json checkpoint.revision must be a non-empty string when present"
@@ -448,34 +622,43 @@ pub fn checkpoint_decl(manifest: &serde_json::Value) -> Option<Result<Checkpoint
             }
         },
     };
-    let files: Vec<String> = match obj.get("files").and_then(|v| v.as_array()) {
-        Some(list) => list
-            .iter()
-            .map(|v| {
-                v.as_str().map(str::to_string).ok_or_else(|| {
-                    "model.json checkpoint.files entries must be strings".to_string()
-                })
-            })
-            .collect::<Result<_, _>>()
-            .ok()?,
-        None => {
-            return bad(
-                "model.json checkpoint.files must list the files to fetch (config.json, \
-                 weights, ...)"
-                    .to_string(),
-            );
+    let files: Option<Vec<String>> = match obj.get("files") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let list = match v.as_array() {
+                Some(l) => l,
+                None => {
+                    return bad(
+                        "model.json checkpoint.files must be an array of relative paths; \
+                         drop the field to fetch the whole official repo"
+                            .to_string(),
+                    );
+                }
+            };
+            let mut files: Vec<String> = Vec::with_capacity(list.len());
+            for item in list {
+                let Some(f) = item.as_str() else {
+                    return bad("model.json checkpoint.files entries must be strings".to_string());
+                };
+                files.push(f.to_string());
+            }
+            if files.is_empty() {
+                return bad(
+                    "model.json checkpoint.files is empty; drop the field to fetch the \
+                     whole official repo"
+                        .to_string(),
+                );
+            }
+            if files.iter().any(|f| {
+                f.is_empty() || f.starts_with('/') || f.starts_with('.') || f.contains("..")
+            }) {
+                return bad(
+                    "model.json checkpoint.files entries must be plain relative paths".to_string(),
+                );
+            }
+            Some(files)
         }
     };
-    if files.is_empty() {
-        return bad("model.json checkpoint.files is empty".to_string());
-    }
-    // A path escape in the file list would write outside the package dir.
-    if files
-        .iter()
-        .any(|f| f.is_empty() || f.starts_with('/') || f.starts_with('.') || f.contains(".."))
-    {
-        return bad("model.json checkpoint.files entries must be plain relative paths".to_string());
-    }
     Some(Ok(CheckpointDecl {
         repo,
         revision,
@@ -483,36 +666,138 @@ pub fn checkpoint_decl(manifest: &serde_json::Value) -> Option<Result<Checkpoint
     }))
 }
 
-/// Fetch the declared checkpoint files into the package directory (flat,
-/// beside model.json -- the layout TorchEngine and the HF cache both
-/// expect). Idempotent per file: an already-present file is a cache hit and
-/// touches no network.
 pub fn fetch_checkpoint(hub: &Hub, dir: &Path, decl: &CheckpointDecl) -> Result<(), String> {
     let revision = decl.revision_on(hub);
-    let mut last: Option<PathBuf> = None;
-    for file in &decl.files {
-        last = Some(
-            hub.get(&decl.repo, revision, file, dir)
-                .map_err(|err| format!("{err} ({})", hub.checkpoint_hint(&decl.repo)))?,
-        );
-    }
-    if let Some(p) = last {
-        tracing::info!(
-            hub = hub.slug(),
-            repo = %decl.repo,
-            revision = %revision,
-            files = decl.files.len(),
-            cache = %p.parent().map(|d| d.display().to_string()).unwrap_or_default(),
-            "checkpoint fetched from the official repo"
-        );
+    match &decl.files {
+        Some(files) => {
+            for file in files {
+                hub.get(&decl.repo, revision, file, dir)
+                    .map_err(|err| format!("{err} ({})", hub.checkpoint_hint(&decl.repo)))?;
+            }
+            let missing = missing_weight_shards(dir)?;
+            if !missing.is_empty() {
+                return Err(format!(
+                    "model.json checkpoint.files for {} is incomplete: the safetensors \
+                     index references shards not fetched: {}",
+                    decl.repo,
+                    missing.join(", ")
+                ));
+            }
+            tracing::info!(
+                hub = hub.slug(),
+                repo = %decl.repo,
+                revision = %revision,
+                files = files.len(),
+                cache = %dir.display(),
+                "checkpoint fetched from the official repo"
+            );
+        }
+        None => {
+            let listed = hub
+                .list_repo_files(&decl.repo, revision)
+                .map_err(|err| format!("{err} ({})", hub.checkpoint_hint(&decl.repo)))?;
+            let files: Vec<&String> = listed
+                .iter()
+                .filter(|f| {
+                    !Path::new(f)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().starts_with('.'))
+                        .unwrap_or(false)
+                })
+                .collect();
+            if files.is_empty() {
+                return Err(format!(
+                    "the official repo {} on {} listed no files",
+                    decl.repo,
+                    hub.display()
+                ));
+            }
+            for file in &files {
+                hub.get(&decl.repo, revision, file, dir)
+                    .map_err(|err| format!("{err} ({})", hub.checkpoint_hint(&decl.repo)))?;
+            }
+            validate_snapshot(dir, &decl.repo)?;
+            tracing::info!(
+                hub = hub.slug(),
+                repo = %decl.repo,
+                revision = %revision,
+                files = files.len(),
+                cache = %dir.display(),
+                "checkpoint snapshot fetched from the official repo"
+            );
+        }
     }
     Ok(())
 }
 
-/// Verdict's own cache root: $VERDICT_CACHE if set (the container case -- one
-/// mount point holds every model), else $XDG_CACHE_HOME/verdict, else
-/// ~/.cache/verdict.
-fn verdict_cache_root() -> PathBuf {
+const SNAPSHOT_REQUIRED: [&str; 5] = [
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "processor_config.json",
+    "chat_template.jinja",
+];
+
+fn validate_snapshot(dir: &Path, repo: &str) -> Result<(), String> {
+    let mut missing: Vec<String> = SNAPSHOT_REQUIRED
+        .iter()
+        .filter(|f| !dir.join(f).is_file())
+        .map(|f| f.to_string())
+        .collect();
+    if !dir.join("model.safetensors").is_file() && !has_weight_index(dir) {
+        missing.push("model.safetensors (or a sharded *.safetensors.index.json)".to_string());
+    }
+    missing.extend(missing_weight_shards(dir)?);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the official repo {repo} does not look like a servable checkpoint; missing: {}",
+        missing.join(", ")
+    ))
+}
+
+fn has_weight_index(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok()).any(|e| {
+                e.path()
+                    .file_name()
+                    .map(|n| n.to_string_lossy().ends_with(".safetensors.index.json"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn missing_weight_shards(dir: &Path) -> Result<Vec<String>, String> {
+    let mut missing = Vec::new();
+    let entries = std::fs::read_dir(dir).map_err(|err| format!("read {}: {err}", dir.display()))?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".safetensors.index.json") {
+            continue;
+        }
+        let raw = std::fs::read_to_string(entry.path())
+            .map_err(|err| format!("read {}: {err}", entry.path().display()))?;
+        let index: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|err| format!("invalid {name}: {err}"))?;
+        let Some(map) = index.get("weight_map").and_then(|v| v.as_object()) else {
+            return Err(format!("{name} has no weight_map object"));
+        };
+        let mut shards: Vec<&str> = map.values().filter_map(|v| v.as_str()).collect();
+        shards.sort_unstable();
+        shards.dedup();
+        for shard in shards {
+            if !dir.join(shard).is_file() {
+                missing.push(shard.to_string());
+            }
+        }
+    }
+    Ok(missing)
+}
+
+pub fn verdict_cache_root() -> PathBuf {
     if let Ok(dir) = std::env::var("VERDICT_CACHE") {
         return PathBuf::from(dir);
     }
@@ -528,29 +813,18 @@ fn verdict_cache_root() -> PathBuf {
         .join("verdict")
 }
 
-/// A stalled download must fail loudly, not hang forever. Observed in the
-/// wild: a ModelScope CDN connection that had already delivered the
-/// whole body never sent the stream terminator, and the read blocked in
-/// recvfrom indefinitely -- startup hung with no output. Every read must
-/// deliver SOMETHING within this window (ureq's per-read socket timeout);
-/// a slow but flowing stream is never cut.
 const HTTP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Attempts per file. Stalls and transport errors retry; 4xx does not.
 const HTTP_ATTEMPTS: u32 = 3;
 
-/// Backoff between download attempts.
 const HTTP_BACKOFF_SECS: [u64; 2] = [1, 3];
 
-/// A fetch failure, split by whether another attempt can help.
 #[derive(Debug)]
 pub enum FetchErr {
-    /// 4xx or a local-disk error: retrying cannot change the answer.
     Terminal(String),
-    /// Stall, transport, or 5xx: worth another attempt.
+
     Retryable(String),
 }
-
 impl FetchErr {
     pub fn message(self) -> String {
         match self {
@@ -559,32 +833,18 @@ impl FetchErr {
     }
 }
 
-/// The agent every hub download goes through: per-read timeout set; connect
-/// timeout is ureq's 30 s default. Public via `http_agent_with_read_timeout`
-/// for tests; the default agent stays internal.
 pub fn http_agent_with_read_timeout(timeout: std::time::Duration) -> ureq::Agent {
     ureq::AgentBuilder::new().timeout_read(timeout).build()
 }
-
 fn http_agent() -> ureq::Agent {
     http_agent_with_read_timeout(HTTP_READ_TIMEOUT)
 }
 
-/// Plain HTTPS download with retries and a progress bar (a multi-hundred-MB
-/// graph must not download in silence). Redirects (CDN) are followed by ureq
-/// defaults. `MODELSCOPE_API_TOKEN` rides as a Bearer header. Public for the
-/// gated network test.
-///
-/// Cache-poisoning guard: bytes land in `<dest>.part` and are renamed into
-/// place only on a complete body -- a killed download must never leave a
-/// truncated file where a later run would mistake it for a cache hit.
 pub fn http_download(url: &str, dest: &Path) -> Result<(), String> {
     let bearer = std::env::var("MODELSCOPE_API_TOKEN").ok();
     http_download_auth(url, dest, bearer.as_deref())
 }
 
-/// `http_download` with an explicit bearer token (the HF path passes
-/// HF_TOKEN; ModelScope's env var is read by `http_download`).
 pub fn http_download_auth(url: &str, dest: &Path, bearer: Option<&str>) -> Result<(), String> {
     let agent = http_agent();
     let mut last = String::new();
@@ -612,9 +872,6 @@ pub fn http_download_auth(url: &str, dest: &Path, bearer: Option<&str>) -> Resul
     Err(last)
 }
 
-/// One download attempt. Public (with `FetchErr` and
-/// `http_agent_with_read_timeout`) so tests can drive the stall path with a
-/// short timeout instead of a 30 s wait.
 pub fn http_download_once(
     agent: &ureq::Agent,
     url: &str,
@@ -629,11 +886,10 @@ pub fn http_download_once(
     ));
     let result = download_body(agent, url, dest, &part, bearer);
     if result.is_err() {
-        let _ = std::fs::remove_file(&part); // never leave a torn file around
+        let _ = std::fs::remove_file(&part);
     }
     result
 }
-
 fn download_body(
     agent: &ureq::Agent,
     url: &str,
@@ -649,7 +905,6 @@ fn download_body(
     if let Some(token) = bearer {
         request = request.set("Authorization", &format!("Bearer {token}"));
     }
-    // ureq 2.x surfaces >=400 as Err(Status(..)) and follows redirects.
     let response = request.call().map_err(|err| match err {
         ureq::Error::Status(code, _) if (400..500).contains(&code) => {
             FetchErr::Terminal(format!("{url}: HTTP {code}"))
@@ -667,12 +922,6 @@ fn download_body(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     pb.set_message(name.clone());
-    // The bar itself is invisible when stderr is not a terminal -- `docker logs`
-    // is a pipe, so inside a container the user would otherwise watch a silent
-    // multi-GB download and conclude it hung. Log every file, the way docker
-    // pull logs every layer and pip every package; a package is a handful of
-    // files, so this is a dozen lines, not noise.
-
     let started = std::time::Instant::now();
     let mut reader = response.into_reader();
     let mut file = std::fs::File::create(part)

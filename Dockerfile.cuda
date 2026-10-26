@@ -11,8 +11,9 @@
 # --gpus all is not optional: without the host's NVIDIA runtime the engine
 # finds no CUDA and quietly serves on CPU.
 
-# Move BASE together with the dependency pins (rebuilt by Dockerfile.base-cuda).
-ARG BASE=sgyaqing/verdict:base-0.2-cuda
+# Move BASE together with the dependency pins (rebuilt by Dockerfile.base-cuda;
+# the pillow-only increment is Dockerfile.base-pillow).
+ARG BASE=sgyaqing/verdict:base-0.3-cuda
 FROM ${BASE}
 
 # No maintainer/author labels.
@@ -27,3 +28,4 @@ LABEL org.opencontainers.image.title="Verdict (CUDA)" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 COPY --from=bin /verdict /usr/local/bin/verdict
+COPY LICENSE NOTICE /usr/share/licenses/verdict/

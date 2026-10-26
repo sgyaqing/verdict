@@ -1,31 +1,7 @@
-//! `/v1/decisions`: OpenAI's cross-ecosystem Decisions API -- the dialect
-//! LiteLLM's unified decision endpoint serves alongside `/v1/systemone`. One
-//! request carries one `input` (shared evidence) plus a
-//! LIST of typed questions; answers come back as a parallel array.
-//!
-//! Schema source of truth: the installed OpenAI SDK 3.26.0
-//! (`types/decision_create_params.py` + `types/decision.py`, generated from
-//! OpenAI's OpenAPI spec). Dialect notes:
-//!   - `input` accepts a string or an array of user messages; Verdict
-//!     flattens the message form to its text parts joined with newlines and
-//!     rejects image parts (text-only decision models).
-//!   - `choice` values are TYPED (string or boolean; "a string and a boolean
-//!     with the same text are distinct"): the rendered option text is the
-//!     value plus its optional description ("value: description", the same
-//!     rendering as the Jev criteria), and the answer echoes the original
-//!     JSON type.
-//!   - The dialect defines a fourth answer type, `refusal` ("the host may
-//!     decline one question"); Verdict emits only the three model-derived
-//!     answer types.
-//!   - Like `/v1/systemone`, an adapter over already-graded semantics: every
-//!     question is one engine task; the correctness gate is mapping tests
-//!     (tests/decisions.rs). Malformed questions answer 400 in Verdict's
-//!     unified error envelope, the message naming the question (by name when
-//!     present, else by index).
-
-use std::sync::Arc;
-use std::time::Instant;
-
+use crate::calibration::Calibrated;
+use crate::metrics;
+use crate::pipeline::Pool;
+use crate::protocol::{ApiError, MAX_OPTIONS, MIN_OPTIONS, ValidJson};
 use axum::Router;
 use axum::extract::State;
 use axum::response::Json;
@@ -33,34 +9,24 @@ use axum::routing::post;
 use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
+use std::time::Instant;
 
-use crate::calibration::Calibrated;
-use crate::metrics;
-use crate::pipeline::Pool;
-use crate::protocol::{ApiError, MAX_OPTIONS, MIN_OPTIONS, ValidJson};
-
-/// Decisions routes, merged into the native router (state applied there).
 pub fn routes() -> Router<Arc<Pool>> {
     Router::new().route("/v1/decisions", post(create_decision))
 }
-
-// ---------------------------------------------------------------- request
-
 #[derive(Debug, Deserialize)]
 pub struct DecisionsRequest {
-    /// Required by the dialect; ignored -- one process serves one model.
     pub model: String,
-    /// Shared evidence: a string, or an array of user messages (text parts).
+
     pub input: Value,
-    /// Questions in order; answers are a parallel array.
+
     pub questions: Vec<Value>,
-    /// Accepted for shape compatibility, ignored.
+
     #[serde(default)]
     pub safety_identifier: Option<String>,
 }
 
-/// One question, kept raw through deserialization so every rejection can
-/// name the offending question.
 #[derive(Debug, Deserialize)]
 struct RawQuestion {
     #[serde(rename = "type")]
@@ -75,17 +41,25 @@ struct RawQuestion {
     levels: Option<Value>,
 }
 
-// ---------------------------------------------------------------- input
-
-/// Flatten the dialect's `input` to the state string: a string passes
-/// through; the message form contributes its text parts, all joined with
-/// newlines (our rendering choice -- the dialect does not define a join).
-/// Image parts are rejected: Verdict serves text-only decision models.
-pub fn flatten_input(input: &Value) -> Result<String, ApiError> {
+pub fn flatten_input(
+    input: &Value,
+    media_capable: bool,
+) -> Result<(String, Vec<crate::tokenize::MediaItem>), ApiError> {
+    let mut media = Vec::new();
+    let mut segments: Vec<String> = Vec::new();
+    let mut image_part = |url: &str| -> Result<String, ApiError> {
+        if !media_capable {
+            return Err(ApiError::InvalidRequest(
+                "this model does not accept image input (no processor in the package)".to_string(),
+            ));
+        }
+        let data = parse_data_uri(url)?;
+        media.push(data);
+        Ok(crate::family::letter_branches::VISION_BLOCK.to_string())
+    };
     match input {
-        Value::String(s) => Ok(s.clone()),
+        Value::String(s) => segments.push(s.clone()),
         Value::Array(messages) => {
-            let mut texts: Vec<String> = Vec::new();
             for (i, message) in messages.iter().enumerate() {
                 if message.get("role").and_then(Value::as_str) != Some("user") {
                     return Err(ApiError::InvalidRequest(format!(
@@ -93,12 +67,12 @@ pub fn flatten_input(input: &Value) -> Result<String, ApiError> {
                     )));
                 }
                 match message.get("content") {
-                    Some(Value::String(text)) => texts.push(text.clone()),
+                    Some(Value::String(text)) => segments.push(text.clone()),
                     Some(Value::Array(parts)) => {
                         for part in parts {
                             match part.get("type").and_then(Value::as_str) {
                                 Some("input_text") => {
-                                    texts.push(
+                                    segments.push(
                                         part.get("text")
                                             .and_then(Value::as_str)
                                             .ok_or_else(|| {
@@ -111,11 +85,19 @@ pub fn flatten_input(input: &Value) -> Result<String, ApiError> {
                                     );
                                 }
                                 Some("input_image") => {
-                                    return Err(ApiError::InvalidRequest(
-                                        "input image parts are not supported: Verdict serves \
-                                         text-only decision models"
-                                            .to_string(),
-                                    ));
+                                    let url = part.get("image_url").ok_or_else(|| {
+                                        ApiError::InvalidRequest(
+                                            "input_image parts must carry image_url".to_string(),
+                                        )
+                                    })?;
+                                    let url = url.as_str().ok_or_else(|| {
+                                        ApiError::InvalidRequest(
+                                            "input_image image_url must be a string (the \
+                                             Responses-API shape)"
+                                                .to_string(),
+                                        )
+                                    })?;
+                                    segments.push(image_part(url)?);
                                 }
                                 other => {
                                     return Err(ApiError::InvalidRequest(format!(
@@ -132,16 +114,61 @@ pub fn flatten_input(input: &Value) -> Result<String, ApiError> {
                     }
                 }
             }
-            Ok(texts.join("\n"))
         }
-        other => Err(ApiError::InvalidRequest(format!(
-            "input must be a string or an array of user messages (got {other})"
-        ))),
+        other => {
+            return Err(ApiError::InvalidRequest(format!(
+                "input must be a string or an array of user messages (got {other})"
+            )));
+        }
     }
+    Ok((segments.join("\n"), media))
 }
 
-/// The rendered option text of a typed choice value: booleans spell out,
-/// strings pass through (the answer echoes the original type, not this).
+fn parse_data_uri(url: &str) -> Result<crate::tokenize::MediaItem, ApiError> {
+    use base64::Engine as _;
+    if !url.starts_with("data:") {
+        return Err(ApiError::InvalidRequest(
+            "input_image supports data URIs only for now (got a non-data url); inline the \
+             image as data:image/png;base64,..."
+                .to_string(),
+        ));
+    }
+    let (head, payload) = url
+        .split_once(',')
+        .ok_or_else(|| ApiError::InvalidRequest("input_image data URI has no comma".to_string()))?;
+    let mime = head
+        .strip_prefix("data:")
+        .and_then(|h| h.split(';').next())
+        .unwrap_or("");
+    let format = match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpeg",
+        "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        other => {
+            return Err(ApiError::InvalidRequest(format!(
+                "input_image mime {other:?} is not a supported image type"
+            )));
+        }
+    };
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|err| {
+            ApiError::InvalidRequest(format!("input_image base64 is invalid ({err})"))
+        })?;
+    if data.is_empty() {
+        return Err(ApiError::InvalidRequest(
+            "input_image decoded image is empty".to_string(),
+        ));
+    }
+    Ok(crate::tokenize::MediaItem::Image(
+        crate::tokenize::MediaFrame {
+            format: format.to_string(),
+            data,
+        },
+    ))
+}
+
 pub fn choice_value_text(value: &Value) -> Result<String, ApiError> {
     match value {
         Value::String(s) => Ok(s.clone()),
@@ -152,21 +179,17 @@ pub fn choice_value_text(value: &Value) -> Result<String, ApiError> {
     }
 }
 
-// ------------------------------------------------------------- preparation
-
-/// A validated question, ready to become one engine task.
 struct Prepared {
     name: Option<String>,
     task: &'static str,
     instructions: String,
-    /// Rendered option texts in marker order (empty for predicate).
+
     options: Vec<String>,
-    /// choice only: the TYPED values, echoed verbatim in the answer.
+
     values: Vec<Value>,
-    /// score only: the level labels, echoed in the answer probabilities.
+
     labels: Vec<String>,
 }
-
 fn question_error(pre: &Prepared, index: usize, detail: impl std::fmt::Display) -> ApiError {
     match &pre.name {
         Some(name) => ApiError::InvalidRequest(format!("question {name:?}: {detail}")),
@@ -174,7 +197,6 @@ fn question_error(pre: &Prepared, index: usize, detail: impl std::fmt::Display) 
     }
 }
 
-/// A name-bearing error before the question body itself parses.
 fn raw_question_error(
     name: Option<&str>,
     index: usize,
@@ -185,9 +207,7 @@ fn raw_question_error(
         None => ApiError::InvalidRequest(format!("question {index}: {detail}")),
     }
 }
-
 fn prepare(index: usize, raw: &Value) -> Result<Prepared, ApiError> {
-    // Fish out name first so even parse failures can name the question.
     let name = raw.get("name").and_then(Value::as_str).map(str::to_string);
     let q: RawQuestion = serde_json::from_value(raw.clone())
         .map_err(|err| raw_question_error(name.as_deref(), index, err))?;
@@ -212,7 +232,6 @@ fn prepare(index: usize, raw: &Value) -> Result<Prepared, ApiError> {
     }
     match q.qtype.as_str() {
         "predicate" => {
-            // No criteria in this dialect: the engine's fixed noul pair.
             pre.task = "noul";
         }
         "choice" => {
@@ -281,7 +300,6 @@ fn prepare(index: usize, raw: &Value) -> Result<Prepared, ApiError> {
     }
     Ok(pre)
 }
-
 fn check_count(pre: &Prepared, index: usize, count: usize, what: &str) -> Result<(), ApiError> {
     if !(MIN_OPTIONS..=MAX_OPTIONS).contains(&count) {
         return Err(question_error(
@@ -292,20 +310,15 @@ fn check_count(pre: &Prepared, index: usize, count: usize, what: &str) -> Result
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------- response
-
 #[derive(Debug, Serialize)]
 struct UsageInputDetails {
     cache_write_tokens: u64,
     cached_tokens: u64,
 }
-
 #[derive(Debug, Serialize)]
 struct UsageOutputDetails {
     reasoning_tokens: u64,
 }
-
 #[derive(Debug, Serialize)]
 struct DecisionsUsage {
     input_tokens: u64,
@@ -314,13 +327,11 @@ struct DecisionsUsage {
     output_tokens_details: UsageOutputDetails,
     total_tokens: u64,
 }
-
 #[derive(Debug, Serialize)]
 struct ChoiceProbability {
     value: Value,
     probability: f64,
 }
-
 #[derive(Debug, Serialize)]
 struct ScoreProbability {
     label: String,
@@ -328,10 +339,6 @@ struct ScoreProbability {
     probability: f64,
 }
 
-/// One typed answer (SDK decision.py): predicate is a probability, choice
-/// echoes the TYPED value with per-value probabilities, score carries the
-/// expected level over label-keyed probabilities. `name` echoes the question
-/// when it had one; `refusal` is deliberately never emitted (module docs).
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Answer {
@@ -355,7 +362,6 @@ enum Answer {
         score: f64,
     },
 }
-
 fn answer(p: &Prepared, c: &Calibrated) -> Answer {
     match p.task {
         "choice" => {
@@ -396,9 +402,6 @@ fn answer(p: &Prepared, c: &Calibrated) -> Answer {
         },
     }
 }
-
-// ---------------------------------------------------------------- handler
-
 #[tracing::instrument(skip_all, fields(task = "decisions", questions = req.questions.len()))]
 async fn create_decision(
     State(pool): State<Arc<Pool>>,
@@ -409,36 +412,47 @@ async fn create_decision(
             "questions must contain at least one question".to_string(),
         ));
     }
-    let state = flatten_input(&req.input)?;
-    // Validate everything before submitting anything: one malformed question
-    // rejects the whole request without spending engine work.
+    let (state, media) = flatten_input(&req.input, pool.media_capable())?;
     let prepared: Vec<Prepared> = req
         .questions
         .iter()
         .enumerate()
         .map(|(index, raw)| prepare(index, raw))
         .collect::<Result<_, _>>()?;
-
-    // Fire every question concurrently: the batcher packs them into one
-    // batch, exactly like /v1/systemone. Each question records its own
-    // decision metric (one decision = one record, wherever it came from).
-    let results = try_join_all(prepared.iter().map(|p| async {
-        let started = Instant::now();
-        let result = pool
-            .run_task(p.task, &p.instructions, &state, &p.options, 0)
-            .await;
-        if result.is_ok() {
-            metrics::record_decision(p.task, started.elapsed().as_millis() as u64);
+    let results = try_join_all(prepared.iter().map(|p| {
+        let media = media.clone();
+        let state = state.clone();
+        let pool = Arc::clone(&pool);
+        async move {
+            let started = Instant::now();
+            let result = pool
+                .run_task(p.task, &p.instructions, &state, &p.options, &media, 0)
+                .await;
+            if result.is_ok() {
+                metrics::record_decision(p.task, started.elapsed().as_millis() as u64);
+            }
+            result
         }
-        result
     }))
     .await?;
-
     let mut answers = Vec::with_capacity(prepared.len());
     let mut input_tokens = 0u64;
-    for (p, (calibrated, tokens)) in prepared.iter().zip(results) {
+    for (p, (calibrated, tokens)) in prepared.iter().zip(&results) {
         input_tokens += tokens;
-        answers.push(answer(p, &calibrated));
+        answers.push(answer(p, calibrated));
+    }
+    if !media.is_empty()
+        && matches!(
+            pool.family(),
+            crate::family::Family::LetterReadout | crate::family::Family::LetterBranches
+        )
+    {
+        let n = results.len() as u64;
+        let first = &prepared[0];
+        let row_len = pool.build_row_ids(first.task, &first.instructions, &state, &first.options)[0]
+            .len() as u64;
+        let prefix = results[0].1 - (row_len - pool.state_prefix_len(&state) as u64);
+        input_tokens -= (n - 1) * prefix;
     }
     Ok(Json(DecisionsResponse {
         model: pool.served_model().to_string(),
@@ -457,7 +471,6 @@ async fn create_decision(
         },
     }))
 }
-
 #[derive(Debug, Serialize)]
 struct DecisionsResponse {
     model: String,

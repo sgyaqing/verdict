@@ -11,7 +11,8 @@
 #   APT_MIRROR    debian mirror for the builder stage (default: stock sources)
 #   CARGO_MIRROR  sparse cargo index for the builder stage
 #   BASE_TAG      override the base image
-#                 (default: sgyaqing/verdict:base-0.2-<flavor>)
+#                 (default: base-0.2-cpu / base-0.3-cuda -- the cuda base
+#                 carries the pillow increment for the mm executor)
 #   ACR_REGISTRY  when set, the image is also tagged
 #                 <ACR_REGISTRY>/sgyaqing/verdict:<ver>-<flavor>
 #
@@ -23,11 +24,11 @@ set -euo pipefail
 VERSION=${1:?usage: release.sh VERSION FLAVOR [REVISION]}
 FLAVOR=${2:?usage: release.sh VERSION FLAVOR [REVISION]}
 REVISION=${3:-}
-BASE_TAG=${BASE_TAG:-sgyaqing/verdict:base-0.2-${FLAVOR}}
-
 case "$FLAVOR" in
-  cpu)  BUILD_FILE=Dockerfile.build      THIN_FILE=Dockerfile ;;
-  cuda) BUILD_FILE=Dockerfile.build.cuda THIN_FILE=Dockerfile.cuda ;;
+  cpu)  BUILD_FILE=Dockerfile.build      THIN_FILE=Dockerfile
+        BASE_TAG="${BASE_TAG:-sgyaqing/verdict:base-0.2-cpu}" ;;
+  cuda) BUILD_FILE=Dockerfile.build.cuda THIN_FILE=Dockerfile.cuda
+        BASE_TAG="${BASE_TAG:-sgyaqing/verdict:base-0.3-cuda}" ;;
   *) echo "unknown flavor: $FLAVOR (cpu|cuda)" >&2; exit 2 ;;
 esac
 

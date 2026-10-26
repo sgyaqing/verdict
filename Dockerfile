@@ -23,3 +23,4 @@ LABEL org.opencontainers.image.title="Verdict" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 COPY --from=bin /verdict /usr/local/bin/verdict
+COPY LICENSE NOTICE /usr/share/licenses/verdict/

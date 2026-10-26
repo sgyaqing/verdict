@@ -1,0 +1,23 @@
+# Incremental CUDA base: base-0.2-cuda plus the python deps the v0.3
+# multimodal executor added (pillow for asset decode, torchvision because the
+# Qwen video processor hard-requires it at processor-load time -- even for
+# text-only serving of a VL checkpoint). Layering onto the validated base
+# keeps every other pin byte-identical -- a full donor rebuild would
+# re-resolve the torch stack and invalidate the graded tolerances. The pins
+# match the stack the golden corpus was produced with (transformers 5.19.0 /
+# torch 2.14.1 / PIL 13.0.0 / torchvision 0.29.1, the CPU wheel -- only the
+# processor's availability check reads it). Rebuild from Dockerfile.build.cuda
+# instead when the pins genuinely drift. The CPU flavor needs no counterpart:
+# it ships no python stack at all.
+#
+# Build (domestic pypi mirror):
+#   docker buildx build -f Dockerfile.base-media \
+#     --build-arg BASE=sgyaqing/verdict:base-0.2-cuda \
+#     --platform linux/amd64 --provenance=false --sbom=false \
+#     -t sgyaqing/verdict:base-0.3-cuda --load .
+ARG PYPI_MIRROR=""
+ARG BASE=sgyaqing/verdict:base-0.2-cuda
+FROM ${BASE}
+RUN pip install --no-cache-dir ${PYPI_MIRROR:+-i ${PYPI_MIRROR}} \
+      pillow==13.0.0 torchvision==0.29.1 \
+    && python3 -c "import PIL, torchvision; print('pillow', PIL.__version__, '/ torchvision', torchvision.__version__)"

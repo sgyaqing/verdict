@@ -54,7 +54,9 @@ RUN pip install --no-cache-dir \
       triton==3.8.0 \
       transformers==5.19.0 \
       flash-linear-attention==0.5.2 \
-      fla-core==0.5.2
+      fla-core==0.5.2 \
+      torchvision==0.29.1 \
+      pillow==13.0.0
 
 # ---- causal-conv1d --------------------------------------------------------
 # PyPI ships only an sdist; it compiles here against the pinned torch.

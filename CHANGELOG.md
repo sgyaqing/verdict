@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0 — 2026-10-26
+
+- **First multimodal family**: `verdict-models/OneJev1.6` (0.8b / 4b / 9b / 27b) — images and video on `/v1/systemone` (TypeSafe `assets`), images on `/v1/decisions` (OpenAI `input_image`), answers verified against the official model, hosted on both Hugging Face and ModelScope.
+- **Variant families**: several model sizes under one repo, picked with a `:variant` tag; a bare family name lists the variants. A package can now be just a manifest — first serve snapshots the whole official repo (weights and tokenizer included) and validates completeness.
+- **CUDA graph serving**: text and media decode run from CUDA graphs, fork graphs serve shared-prefix media, and the torch.compile cache persists across restarts.
+- **Request semantics**: new `--max-body-mb` (default 64 MiB); unset `--max-input-tokens` now truncates at the model's declared `max_len`, same as the official SDK; a dead executor process now exits the server non-zero instead of answering 500 forever.
+
+Images on Docker Hub: `sgyaqing/verdict:0.3.0-cpu` and `sgyaqing/verdict:0.3.0-cuda` (linux/amd64).
+
 ## 0.2.1 — 2026-10-19
 
 - **Clean exit**: after the SIGINT drain the process now exits immediately; the previous native teardown path could hang (CPU) or abort (CUDA) at exit. Serving behavior and accuracy were never affected.

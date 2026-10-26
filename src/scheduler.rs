@@ -1,43 +1,16 @@
-//! Dynamic batching scheduler: bounded queue + window batching +
-//! mixed-task flow + ragged-K collate + padded-token budget admission.
-//!
-//! Reference patterns:
-//! - padded-cost admission: `max(max_length, entry_len) * (n + 1) > budget`
-//!   keeps the entry queued (never dropped); entries whose responder was
-//!   dropped (client gone) are skipped at batch time.
-//! - a batch error propagates to EVERY responder in that batch; the head of a
-//!   batch is always admissible so the budget can never starve a request.
-//! - the token budget is decremented across admissions each step.
-//!
-//! Five invariants (each pinned by a test in tests/scheduler.rs, each verified
-//! under mutation):
-//! 1. every submitted request eventually receives a response (success or error)
-//! 2. responses map back to their own request, never crossed
-//! 3. a full queue rejects immediately instead of dropping or blocking
-//! 4. shutdown drains: queued requests are processed, none lost
-//! 5. inference runs on the blocking pool; the async reactor never stalls
-
+use crate::tokenize::{BuiltSequence, Layout};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::tokenize::{BuiltSequence, Layout};
-
-/// Adaptive window probe quantum: how long a LONE queued request waits for
-/// company before being dispatched alone. Small enough to disappear in the
-/// noise next to a 5 ms graph forward, large enough to catch back-to-back
-/// arrivals from one caller.
 const PROBE_QUANTUM: Duration = Duration::from_micros(500);
 
-/// Raw (uncalibrated) per-option logits; calibration happens after the scheduler.
-pub type RawLogits = Vec<f64>;
-
+pub type RawLogits = crate::engine::EngineRow;
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SchedulerError {
     #[error("queue is full, try again later")]
@@ -49,24 +22,17 @@ pub enum SchedulerError {
     #[error("invalid scheduler configuration: {0}")]
     Config(String),
 }
-
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
-    /// Bounded intake capacity; a submit beyond it is rejected (invariant 3).
     pub queue_cap: usize,
-    /// Requests per batch at most.
+
     pub max_batch_size: usize,
-    /// After the first arrival, wait up to this long for the batch to fill.
+
     pub batch_window: Duration,
-    /// Padded-token budget per batch: `batch_max_len * n_requests` (the vLLM
-    /// `max_num_batched_tokens` semantics for a padded model).
+
     pub token_budget: usize,
 }
-
 impl SchedulerConfig {
-    /// Defaults derived the way the CLI wires them: window from `batch_window_ms`,
-    /// budget from `max_batch_size * max_len` so every single (at most max_len)
-    /// request always fits a fresh batch.
     pub fn new(
         queue_cap: usize,
         max_batch_size: usize,
@@ -80,7 +46,6 @@ impl SchedulerConfig {
             token_budget: max_batch_size * max_len,
         }
     }
-
     pub fn validate(&self, max_len: usize) -> Result<(), String> {
         if self.queue_cap == 0 {
             return Err("queue_cap must be positive".to_string());
@@ -88,7 +53,6 @@ impl SchedulerConfig {
         if self.max_batch_size == 0 {
             return Err("max_batch_size must be positive".to_string());
         }
-        // Otherwise a max-length request could never be admitted -> starvation.
         if self.token_budget < max_len {
             return Err(format!(
                 "token_budget ({}) must be >= max_len ({}) so a single request always fits",
@@ -99,22 +63,16 @@ impl SchedulerConfig {
     }
 }
 
-/// One admitted request flowing through the pipeline.
 pub struct ScheduledRequest {
     pub task: String,
     pub built: BuiltSequence,
     pub respond: oneshot::Sender<Result<RawLogits, SchedulerError>>,
-    /// vLLM-aligned priority: smaller value = admitted earlier (default 0).
+
     pub priority: i64,
-    /// Global arrival sequence assigned at submit; the ordering tiebreak
-    /// (vLLM compares arrival_time then request_id; seq is both in one).
+
     pub seq: u64,
 }
 
-/// Exactly the ONNX graph's input tensors, flat row-major. `l` is the batch max
-/// REAL length (pad-to-batch-max); `k` is the batch max marker count. The graph
-/// writes -1e4 into masked marker slots; rows are trimmed to their real_k before
-/// responses leave, so sentinels never reach a caller.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CollatedBatch {
     pub input_ids: Vec<i64>,
@@ -122,45 +80,35 @@ pub struct CollatedBatch {
     pub marker_pos: Vec<i64>,
     pub marker_mask: Vec<bool>,
     pub qtype: Vec<i64>,
-    /// Letter-readout dialect: option count per request (its single slot's
-    /// width). Empty for the marker dialects, whose `k` already carries it.
+
     pub nopts: Vec<i64>,
+
+    pub media: Vec<crate::tokenize::MediaItem>,
+    pub media_counts: Vec<i64>,
+    pub row_texts: Vec<String>,
     pub b: usize,
     pub l: usize,
     pub k: usize,
-    /// Per-row real shapes (post-padding truth) for result splitting.
+
     pub rows: Vec<RowMeta>,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowMeta {
     pub real_len: usize,
     pub real_k: usize,
 }
 
-/// Blocking batch inference. Runs ONLY inside `spawn_blocking` (invariant 5).
-/// Contract: returns one row per input row, in batch order, each at least
-/// `real_k` long (the graph emits -1e4 at masked slots, which the scheduler
-/// trims).
-pub type BatchRunner = Arc<dyn Fn(CollatedBatch) -> Result<Vec<Vec<f64>>, String> + Send + Sync>;
+pub type BatchRunner =
+    Arc<dyn Fn(CollatedBatch) -> Result<Vec<crate::engine::EngineRow>, String> + Send + Sync>;
 
-/// Right-pad every row to the batch max length, pad marker slots to the batch
-/// max marker count (marker_pos 0 / marker_mask false), one qtype per row.
 pub fn collate(items: &[ScheduledRequest], layout: &Layout) -> CollatedBatch {
     let b = items.len();
     let mut l = items.iter().map(|r| r.built.ids.len()).max().unwrap_or(0);
     if !layout.fixed_classes.is_empty() {
-        // Static-S sessions: pad to the smallest class that fits. A batch
-        // longer than the largest class keeps its own length -- the engine
-        // then fails it loudly (no session matches) instead of truncating.
         if let Some(&class) = layout.fixed_classes.iter().find(|&&c| c >= l) {
             l = class;
         }
     } else if layout.seq_align > 1 {
-        // Some graphs require padded lengths to be a multiple of an internal
-        // chunk size (e.g. Qwen3.5 linear attention = 64); the CUDA EP rejects
-        // unaligned lengths. Manifest-driven via `seq_align` in model.json —
-        // extra pad tokens with attention_mask=0 are semantically inert.
         l = l.div_ceil(layout.seq_align) * layout.seq_align;
     }
     let k = items
@@ -175,6 +123,9 @@ pub fn collate(items: &[ScheduledRequest], layout: &Layout) -> CollatedBatch {
     let mut qtype = Vec::with_capacity(b);
     let mut nopts = Vec::with_capacity(b);
     let mut rows = Vec::with_capacity(b);
+    let mut media = Vec::new();
+    let mut media_counts = Vec::with_capacity(b);
+    let mut row_texts = Vec::with_capacity(b);
     for (i, req) in items.iter().enumerate() {
         let real_len = req.built.ids.len();
         input_ids.extend(req.built.ids.iter().map(|id| *id as i64));
@@ -190,6 +141,9 @@ pub fn collate(items: &[ScheduledRequest], layout: &Layout) -> CollatedBatch {
         if !req.built.nopts.is_empty() {
             nopts.push(real_k as i64);
         }
+        media.extend(req.built.media.iter().cloned());
+        media_counts.push(req.built.media.len() as i64);
+        row_texts.push(req.built.text.clone());
         rows.push(RowMeta { real_len, real_k });
     }
     CollatedBatch {
@@ -199,6 +153,9 @@ pub fn collate(items: &[ScheduledRequest], layout: &Layout) -> CollatedBatch {
         marker_mask,
         qtype,
         nopts,
+        media,
+        media_counts,
+        row_texts,
         b,
         l,
         k,
@@ -206,11 +163,7 @@ pub fn collate(items: &[ScheduledRequest], layout: &Layout) -> CollatedBatch {
     }
 }
 
-/// Batch admission policy seam; FCFS is the default, `priority` optional.
 pub trait SchedulingPolicy: Send + Sync + 'static {
-    /// Move the requests admitted into the next batch out of `pending`;
-    /// leftovers stay queued. Must admit at least one open request whenever
-    /// `pending` holds one (otherwise the loop would stall).
     fn admit(
         &self,
         pending: &mut VecDeque<ScheduledRequest>,
@@ -219,11 +172,6 @@ pub trait SchedulingPolicy: Send + Sync + 'static {
     ) -> Vec<ScheduledRequest>;
 }
 
-/// Front-of-queue admission scan shared by the policies: admit while the
-/// padded cost `max_l * n` stays within the token budget. Entries whose
-/// responder is already closed (client disconnected) are skipped, not
-/// counted. The FIRST entry is always admitted (no stall on a single
-/// over-budget request).
 fn admit_in_front_order(
     pending: &mut VecDeque<ScheduledRequest>,
     max_batch_size: usize,
@@ -233,7 +181,7 @@ fn admit_in_front_order(
     let mut max_l = 0usize;
     while let Some(req) = pending.pop_front() {
         if req.respond.is_closed() {
-            continue; // nobody is waiting; skip instead of wasting a batch slot
+            continue;
         }
         let candidate_l = max_l.max(req.built.ids.len());
         let cost_fits = batch.is_empty() || candidate_l * (batch.len() + 1) <= token_budget;
@@ -241,16 +189,14 @@ fn admit_in_front_order(
             max_l = candidate_l;
             batch.push(req);
         } else {
-            pending.push_front(req); // stays queued for the next batch, never dropped
+            pending.push_front(req);
             break;
         }
     }
     batch
 }
 
-/// First-come-first-served (default).
 pub struct Fcfs;
-
 impl SchedulingPolicy for Fcfs {
     fn admit(
         &self,
@@ -262,11 +208,7 @@ impl SchedulingPolicy for Fcfs {
     }
 }
 
-/// Priority policy (vLLM `policy=priority` semantics: smaller `priority`
-/// first, earlier arrival as tiebreak).
-/// Sorting is O(n log n) per window, n bounded by queue_cap.
 pub struct Priority;
-
 impl SchedulingPolicy for Priority {
     fn admit(
         &self,
@@ -274,24 +216,19 @@ impl SchedulingPolicy for Priority {
         max_batch_size: usize,
         token_budget: usize,
     ) -> Vec<ScheduledRequest> {
-        // seq is unique, so (priority, seq) is a total order.
         pending
             .make_contiguous()
             .sort_by_key(|r| (r.priority, r.seq));
         admit_in_front_order(pending, max_batch_size, token_budget)
     }
 }
-
 pub struct SchedulerHandle {
     tx: mpsc::Sender<ScheduledRequest>,
     next_seq: AtomicU64,
     join_batching: JoinHandle<()>,
     join_backend: JoinHandle<()>,
 }
-
 impl SchedulerHandle {
-    /// Enqueue without ever blocking or dropping: a full queue returns
-    /// `QueueFull` immediately (the protocol layer maps it to 503).
     pub fn submit(
         &self,
         task: &str,
@@ -315,16 +252,12 @@ impl SchedulerHandle {
         Ok(rx)
     }
 
-    /// Graceful shutdown: close intake, let both tasks drain everything queued
-    /// (intake -> pending -> prefetch channel -> engine), wait for exit
-    /// (invariant 4).
     pub async fn shutdown(self) {
         drop(self.tx);
         let _ = self.join_batching.await;
         let _ = self.join_backend.await;
     }
 }
-
 pub fn spawn_scheduler(
     cfg: SchedulerConfig,
     layout: Layout,
@@ -335,9 +268,6 @@ pub fn spawn_scheduler(
     cfg.validate(layout.max_len)
         .map_err(SchedulerError::Config)?;
     let (tx, rx) = mpsc::channel::<ScheduledRequest>(cfg.queue_cap);
-    // Prefetch depth 1 (TEI structure): batch ASSEMBLY overlaps inference;
-    // engine calls stay strictly sequential (one session behind one mutex) --
-    // this overlaps collation, never execution.
     let (job_tx, job_rx) = mpsc::channel::<Job>(1);
     let join_batching = tokio::spawn(batching_task(cfg, layout, policy, rx, job_tx, replica));
     let join_backend = tokio::spawn(backend_task(runner, job_rx));
@@ -349,17 +279,11 @@ pub fn spawn_scheduler(
     })
 }
 
-/// A fully collated batch on its way to the backend task.
 struct Job {
     items: Vec<ScheduledRequest>,
     batch: CollatedBatch,
 }
 
-/// Stage 1: intake, window batching, admission policy, collation.
-/// Reserve-first: the send permit is acquired BEFORE pulling work, so a full
-/// prefetch slot parks this task at `reserve()` -- natural backpressure with
-/// the documented admission bound `queue_cap + 2 * max_batch_size` (one
-/// forming batch holding a permit, one executing or prefetched).
 async fn batching_task(
     cfg: SchedulerConfig,
     layout: Layout,
@@ -369,38 +293,22 @@ async fn batching_task(
     replica: usize,
 ) {
     let mut pending: VecDeque<ScheduledRequest> = VecDeque::new();
-    let mut open = true; // intake still has live senders
+    let mut open = true;
     let mut permit = None;
     loop {
         let held = match permit.take() {
             Some(held) => held,
             None => match job_tx.reserve().await {
                 Ok(held) => held,
-                // Backend gone: it only exits after this task's sender drops,
-                // so reaching here means the backend panicked.
                 Err(_) => break,
             },
         };
-
-        // Wait for the first arrival (skip the wait when leftovers exist).
         if open && pending.is_empty() {
             match rx.recv().await {
                 Some(req) => pending.push_back(req),
                 None => open = false,
             }
         }
-        // Window fill: gather more arrivals until the batch is full or the
-        // window elapses. Buffered arrivals return instantly, so the window
-        // only costs real waiting when intake runs dry.
-        //
-        // The window exists to let a batch fill under load, but a LONE
-        // request on an idle server would otherwise pay the whole window --
-        // on a fast engine the default is a visible share of the response.
-        // So the wait is probed in short
-        // quanta: with a second request already pending (traffic flowing)
-        // the full window still applies; a lone request dispatches after one
-        // quantum. Under load the queue fills faster than the probe, so the
-        // batching behavior is unchanged where batching matters.
         if open && pending.len() < cfg.max_batch_size {
             let deadline = tokio::time::Instant::now() + cfg.batch_window;
             while pending.len() < cfg.max_batch_size {
@@ -415,12 +323,7 @@ async fn batching_task(
                         open = false;
                         break;
                     }
-                    Err(_) => {
-                        if pending.len() < 2 {
-                            break; // lone request: nothing to wait for
-                        }
-                        // traffic is flowing: keep filling until the window
-                    }
+                    Err(_) => break,
                 }
             }
         }
@@ -429,25 +332,20 @@ async fn batching_task(
                 permit = Some(held);
                 continue;
             }
-            break; // intake closed and drained: exit, dropping job_tx
+            break;
         }
         crate::metrics::record_queue_depth(pending.len(), replica);
         let items = policy.admit(&mut pending, cfg.max_batch_size, cfg.token_budget);
         if items.is_empty() {
-            // Every pending responder was closed (skipped by the policy).
             permit = Some(held);
             continue;
         }
-        // Collation happens HERE, overlapping whatever the backend executes.
         let batch = collate(&items, &layout);
         crate::metrics::record_batch(batch.b, replica);
-        held.send(Job { items, batch }); // never blocks: the permit is held
+        held.send(Job { items, batch });
     }
 }
 
-/// Stage 2 (TEI `backend_task` pattern): run the engine on the blocking pool
-/// and deliver every responder its own trimmed result. Any failure resolves
-/// the WHOLE batch with errors (invariant 1's error path).
 async fn backend_task(runner: BatchRunner, mut job_rx: mpsc::Receiver<Job>) {
     while let Some(Job { items, batch }) = job_rx.recv().await {
         let runner = Arc::clone(&runner);
@@ -456,14 +354,16 @@ async fn backend_task(runner: BatchRunner, mut job_rx: mpsc::Receiver<Job>) {
             Ok(Ok(rows)) if rows.len() == items.len() => {
                 for (req, row) in items.into_iter().zip(rows) {
                     let real_k = req.built.real_k();
-                    if row.len() < real_k {
+                    if row.logits.len() < real_k {
                         let _ = req.respond.send(Err(SchedulerError::Engine(format!(
                             "engine returned {} markers for a request with {real_k}",
-                            row.len()
+                            row.logits.len()
                         ))));
                     } else {
-                        // Trim -1e4 sentinel slots: callers only ever see their own options.
-                        let _ = req.respond.send(Ok(row[..real_k].to_vec()));
+                        let _ = req.respond.send(Ok(RawLogits {
+                            logits: row.logits[..real_k].to_vec(),
+                            expanded_len: row.expanded_len,
+                        }));
                     }
                 }
             }
