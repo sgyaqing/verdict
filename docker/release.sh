@@ -16,9 +16,8 @@
 #   ACR_REGISTRY  when set, the image is also tagged
 #                 <ACR_REGISTRY>/sgyaqing/verdict:<ver>-<flavor>
 #
-# With warm caches a code-only change rebuilds in < 2 min and pushes one
-# ~15 MB layer; a build that starts re-downloading torch means BASE_TAG has
-# drifted from the built base -- fix the tag instead of waiting.
+# A build that starts re-downloading torch means BASE_TAG has drifted from
+# the built base -- fix the tag instead of waiting.
 set -euo pipefail
 
 VERSION=${1:?usage: release.sh VERSION FLAVOR [REVISION]}
@@ -45,8 +44,10 @@ test -s out/verdict || { echo "binary missing after build" >&2; exit 1; }
 ls -lh out/verdict
 
 step "thin image"
+cp out/verdict ./verdict
+trap 'rm -f ./verdict' EXIT
 docker buildx build -f "$THIN_FILE" \
-    --build-context bin=out --platform linux/amd64 \
+    --platform linux/amd64 \
     --build-arg BASE="$BASE_TAG" \
     --build-arg VERSION="$VERSION" --build-arg REVISION="$REVISION" \
     --provenance=false --sbom=false \

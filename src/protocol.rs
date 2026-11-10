@@ -251,6 +251,10 @@ async fn body_limit(
     next.run(req).await
 }
 
+async fn graph_coverage() -> Response {
+    Json(crate::graph_stats::render()).into_response()
+}
+
 async fn metrics_text() -> Response {
     (
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -297,6 +301,7 @@ pub fn router(pool: Arc<Pool>, max_body_bytes: usize) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics_text))
+        .route("/graph", get(graph_coverage))
         .route("/v1/choice", post(choice))
         .route("/v1/score", post(score))
         .route("/v1/noul", post(noul))

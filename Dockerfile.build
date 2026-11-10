@@ -55,6 +55,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends g++ \
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY executor/torch_exec.py ./executor/torch_exec.py
+COPY convert ./convert
 # Cache mounts are not part of the layer snapshot: the binary must be copied
 # out in the SAME RUN -- a later COPY of target/ finds nothing.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

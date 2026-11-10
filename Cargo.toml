@@ -1,6 +1,6 @@
 [package]
 name = "verdict-serve"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "A high-performance serving engine for System One decision models"
@@ -20,26 +20,23 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8.9"
-# bulk request/reply payloads to the torch executor travel as base64 bytes
-# (JSON text of 8k floats costs ~10 ms/batch; b64 is two memcpys)
+# bulk request/reply payloads to the torch executor travel as base64 bytes, not JSON text
 base64 = "0.22"
-# Stream adapters for the SSE chat surface; already in the graph via
-# axum -- declaring it only makes the direct use legal, default-features off.
+# SSE stream adapters; already in the graph via axum -- declared only for direct use, default-features off
 futures-util = { version = "0.3", default-features = false }
-# The only HTTP client: blocking, no reqwest/tokio side, no xet. Both hubs
-# are fetched through it.
+# the only HTTP client: blocking, no reqwest/tokio side; both hubs fetch through it
 ureq = "2.12"
 indicatif = "0.17"
 metrics = "0.23.1"
 metrics-exporter-prometheus = "0.15.1"
 ndarray = "0.17"
-# load-dynamic: the shared library loads at runtime via ORT_DYLIB_PATH, no
-# build-time linking. default-features off drops download-binaries, which
-# would fetch the wrong onnxruntime version.
+# load-dynamic: the dylib loads at runtime via ORT_DYLIB_PATH; default-features off drops download-binaries (wrong onnxruntime version)
 ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic", "cuda"] }
 serde = { version = "1.0.229", features = ["derive"] }
+# SHA256SUMS for converted packages
+sha2 = "0.10"
 # preserve_order: answer maps must keep arrival order (Python/JS semantics)
-serde_json = { version = "1.0.151", features = ["preserve_order"] }
+serde_json = { version = "1.0.151", features = ["preserve_order", "arbitrary_precision"] }
 thiserror = "2.0.21"
 tokenizers = "0.23.2"
 # already in the graph via axum/tower; declared for direct use

@@ -7,7 +7,7 @@ use crate::protocol::{
 use crate::scheduler::{SchedulerError, SchedulerHandle};
 use crate::tokenize::TokenizerBundle;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 pub struct Pipeline {
     bundle: TokenizerBundle,
@@ -16,6 +16,7 @@ pub struct Pipeline {
     max_input_tokens: usize,
     engine: Arc<dyn Engine>,
     served_model: String,
+    next_request: AtomicU64,
 }
 impl Pipeline {
     pub fn new(
@@ -33,7 +34,12 @@ impl Pipeline {
             max_input_tokens,
             engine,
             served_model,
+            next_request: AtomicU64::new(0),
         }
+    }
+
+    fn next_request(&self) -> u64 {
+        self.next_request.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn served_model(&self) -> &str {
@@ -62,6 +68,7 @@ impl Pipeline {
                 &req.options,
                 &[],
                 req.priority(),
+                self.next_request(),
             )
             .await?;
         crate::metrics::record_decision("choice", started.elapsed().as_millis() as u64);
@@ -83,6 +90,7 @@ impl Pipeline {
                 &req.levels,
                 &[],
                 req.priority(),
+                self.next_request(),
             )
             .await?;
         crate::metrics::record_decision("score", started.elapsed().as_millis() as u64);
@@ -97,7 +105,15 @@ impl Pipeline {
     pub async fn noul(&self, req: NoulRequest) -> Result<NoulResponse, ApiError> {
         let started = Instant::now();
         let (calibrated, input_tokens) = self
-            .run_task("noul", &req.claim, &req.state, &[], &[], req.priority())
+            .run_task(
+                "noul",
+                &req.claim,
+                &req.state,
+                &[],
+                &[],
+                req.priority(),
+                self.next_request(),
+            )
             .await?;
         crate::metrics::record_decision("noul", started.elapsed().as_millis() as u64);
         Ok(NoulResponse {
@@ -107,6 +123,7 @@ impl Pipeline {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_task(
         &self,
         task: &str,
@@ -115,19 +132,21 @@ impl Pipeline {
         options: &[String],
         media: &[crate::tokenize::MediaItem],
         priority: i64,
+        request: u64,
     ) -> Result<(Calibrated, u64), ApiError> {
         match self.bundle.family {
             crate::family::Family::LetterReadout | crate::family::Family::LetterBranches => {
-                self.run_task_letter(task, question, state, options, media, priority)
+                self.run_task_letter(task, question, state, options, media, priority, request)
                     .await
             }
             _ => {
-                self.run_task_marker(task, question, state, options, priority)
+                self.run_task_marker(task, question, state, options, priority, request)
                     .await
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_task_letter(
         &self,
         task: &str,
@@ -136,6 +155,7 @@ impl Pipeline {
         options: &[String],
         media: &[crate::tokenize::MediaItem],
         priority: i64,
+        request: u64,
     ) -> Result<(Calibrated, u64), ApiError> {
         let rows = self
             .bundle
@@ -156,7 +176,7 @@ impl Pipeline {
         for row in rows {
             let rx = self
                 .scheduler
-                .submit(task, row, priority)
+                .submit_in(request, task, row, priority)
                 .map_err(map_scheduler_error)?;
             rxs.push(rx);
         }
@@ -179,6 +199,7 @@ impl Pipeline {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_task_marker(
         &self,
         task: &str,
@@ -186,6 +207,7 @@ impl Pipeline {
         state: &str,
         options: &[String],
         priority: i64,
+        request: u64,
     ) -> Result<(Calibrated, u64), ApiError> {
         let built = self.bundle.build_sequence(task, question, state, options);
         let mut input_tokens = built.full_len as u64;
@@ -207,12 +229,12 @@ impl Pipeline {
         };
         let rx = self
             .scheduler
-            .submit(task, built, priority)
+            .submit_in(request, task, built, priority)
             .map_err(map_scheduler_error)?;
         let null_rx = match &null_built {
             Some((null, _)) => Some(
                 self.scheduler
-                    .submit(task, null.clone(), priority)
+                    .submit_in(request, task, null.clone(), priority)
                     .map_err(map_scheduler_error)?,
             ),
             None => None,
@@ -262,6 +284,7 @@ impl Pipeline {
             engine,
             max_input_tokens: _,
             served_model: _,
+            next_request: _,
         } = self;
         scheduler.shutdown().await;
         std::mem::forget((bundle, calibration, engine));
@@ -287,6 +310,7 @@ fn elapsed_ms(started: Instant) -> u64 {
 pub struct Pool {
     replicas: Vec<Arc<Pipeline>>,
     next: AtomicUsize,
+    next_request: AtomicU64,
 }
 impl Pool {
     pub fn new(replicas: Vec<Arc<Pipeline>>) -> Self {
@@ -294,7 +318,12 @@ impl Pool {
         Self {
             replicas,
             next: AtomicUsize::new(0),
+            next_request: AtomicU64::new(0),
         }
+    }
+
+    pub fn next_request(&self) -> u64 {
+        self.next_request.fetch_add(1, Ordering::Relaxed)
     }
 
     async fn route<T, Req>(
@@ -335,6 +364,7 @@ impl Pool {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_task(
         &self,
         task: &str,
@@ -343,13 +373,14 @@ impl Pool {
         options: &[String],
         media: &[crate::tokenize::MediaItem],
         priority: i64,
+        request: u64,
     ) -> Result<(Calibrated, u64), ApiError> {
         let n = self.replicas.len();
         let start = self.next.fetch_add(1, Ordering::Relaxed);
         for i in 0..n {
             let replica = &self.replicas[(start + i) % n];
             match replica
-                .run_task(task, question, state, options, media, priority)
+                .run_task(task, question, state, options, media, priority, request)
                 .await
             {
                 Ok(value) => return Ok(value),

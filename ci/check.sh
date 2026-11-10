@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# The CI pipeline as runnable commands: format, then lint.
-# .github/workflows/ci.yml calls this.
+# The CI pipeline as runnable commands: format, then lint; called by .github/workflows/ci.yml.
 set -euo pipefail
 
 cargo fmt --check

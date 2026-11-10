@@ -8,8 +8,34 @@ fn main() -> ExitCode {
     if verdict::cli::handled_special(&args) {
         return ExitCode::SUCCESS;
     }
-    let mut cfg = match verdict::cli::parse_args(&args) {
-        Ok(cfg) => cfg,
+    let mut cfg = match verdict::cli::parse_command(&args) {
+        Ok(verdict::cli::Command::Serve(cfg)) => cfg,
+        Ok(verdict::cli::Command::Download(dl)) => {
+            verdict::init_tracing_stderr();
+            if dl.progress_json {
+                verdict::progress::install_json();
+            }
+            return match verdict::model_source::download_command(&dl.repo, &dl.dest) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    ExitCode::from(2)
+                }
+            };
+        }
+        Ok(verdict::cli::Command::Convert(cv)) => {
+            verdict::init_tracing_stderr();
+            if cv.progress_json {
+                verdict::progress::install_json();
+            }
+            return match verdict::convert::convert_command(&cv.input, &cv.output) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    ExitCode::from(2)
+                }
+            };
+        }
         Err(message) => {
             eprintln!("verdict: {message}");
             return ExitCode::from(2);
@@ -30,21 +56,23 @@ fn main() -> ExitCode {
         let name = base.rsplit('/').next().unwrap_or(base);
         cfg.served_model_name = Some(format!("{name}:{tag}"));
     }
-    let cache_root = verdict::model_source::verdict_cache_root();
-    let pkg_name = if let Ok(rel) = cfg.model_dir.strip_prefix(&cache_root) {
-        rel.components()
-            .next()
-            .map(|c| c.as_os_str().to_owned())
-            .unwrap_or_else(|| cfg.model_dir.file_name().unwrap_or_default().to_owned())
-    } else {
-        cfg.model_dir.file_name().unwrap_or_default().to_owned()
-    };
+    let compile_cache = verdict::model_source::compile_cache_root(&cfg.model_dir, &spec);
     unsafe {
         std::env::set_var("VERDICT_GRAPH_ROWS_CAP", cfg.max_batch_size.to_string());
+        std::env::set_var("VERDICT_GRAPH_MAX_LEN", cfg.graph_max_len.to_string());
         std::env::set_var(
-            "VERDICT_COMPILE_CACHE",
-            cache_root.join(pkg_name).join("compile"),
+            "VERDICT_GPU_MEMORY_UTILIZATION",
+            (cfg.gpu_memory_utilization / cfg.data_parallel.max(1) as f64).to_string(),
         );
+        std::env::set_var(
+            "VERDICT_FORK_GRAPH_MAX_PREFIX",
+            cfg.fork_graph_max_prefix.to_string(),
+        );
+        std::env::set_var(
+            "VERDICT_FORK_GRAPH_MAX_WIDTH",
+            cfg.fork_graph_max_width.to_string(),
+        );
+        std::env::set_var("VERDICT_COMPILE_CACHE", compile_cache);
         std::env::set_var(
             "VERDICT_EXECUTOR_SHA",
             verdict::torch_engine::executor_sha(),
@@ -119,9 +147,7 @@ fn build_engine(
     if runtime == "torch" {
         if cfg.engine == EngineChoice::Stub {
             if replica == 0 {
-                tracing::warn!(
-                    "--engine stub: serving deterministic pseudo-scores, NOT real inference"
-                );
+                tracing::warn!("engine stub: pseudo-scores, not real inference");
             }
             return Ok(Arc::new(StubEngine::new(std::time::Duration::ZERO)));
         }
@@ -153,9 +179,7 @@ fn build_engine(
     match (cfg.engine, cfg.device) {
         (EngineChoice::Stub, _) => {
             if replica == 0 {
-                tracing::warn!(
-                    "--engine stub: serving deterministic pseudo-scores, NOT real inference"
-                );
+                tracing::warn!("engine stub: pseudo-scores, not real inference");
             }
             Ok(Arc::new(StubEngine::new(std::time::Duration::ZERO)))
         }
@@ -168,15 +192,10 @@ fn build_engine(
                         .is_available()
                         .unwrap_or(false);
                     if cuda_registered {
-                        tracing::info!(
-                            "--device auto: the runtime has the CUDA provider; registering it \
-                             (ORT can still place nodes on CPU -- ORT_LOG=verbose reports where)"
-                        );
+                        tracing::info!("device auto: cuda");
                         verdict::engine::DeviceKind::Cuda
                     } else {
-                        tracing::info!(
-                            "--device auto: the runtime has no CUDA provider; registering CPU"
-                        );
+                        tracing::info!("device auto: cpu");
                         verdict::engine::DeviceKind::Cpu
                     }
                 }
@@ -190,20 +209,13 @@ fn build_engine(
                     .map(|n| n.get())
                     .unwrap_or(0);
                 let suggested = (cores / 24).max(2);
-                tracing::info!(
-                    cores,
-                    suggested_data_parallel = suggested,
-                    "many-core CPU host with --data-parallel 1; on hosts like this \
-                     --data-parallel ~cores/24 typically serves several times more \
-                     requests/s -- sweep N to tune"
-                );
+                tracing::info!("note: --data-parallel ~{suggested} on this host");
             }
             let load_started = std::time::Instant::now();
             tracing::info!(
                 replica,
                 model = %cfg.model_dir.display(),
-                device = %kind.name(),
-                "loading the model graph (a minute or two on first start; the next line comes when it is ready)"
+                "loading the model graph"
             );
             let engine =
                 match OrtEngine::with_device_and_threads(&cfg.model_dir, kind, intra_threads) {
@@ -211,9 +223,7 @@ fn build_engine(
                     Err(EngineError(msg))
                         if device == Device::Auto && kind == verdict::engine::DeviceKind::Cuda =>
                     {
-                        tracing::warn!(
-                            "--device auto: CUDA registration failed ({msg}); serving on CPU"
-                        );
+                        tracing::warn!("device auto: cuda failed ({msg}); serving on cpu");
                         OrtEngine::with_device_and_threads(
                             &cfg.model_dir,
                             verdict::engine::DeviceKind::Cpu,
@@ -225,18 +235,9 @@ fn build_engine(
                 };
             tracing::info!(
                 replica,
-                requested = %device.name(),
-                registered_ep = %kind.name(),
-                model = %cfg.model_dir.display(),
                 secs = load_started.elapsed().as_secs(),
-                "OrtEngine ready (fp32, TF32 off on CUDA)"
+                "model ready"
             );
-            if kind == verdict::engine::DeviceKind::Cuda {
-                tracing::info!(
-                    "a registered provider is not a placement check: ORT decides where the nodes \
-                     run at load time. ORT_LOG=verbose reports it"
-                );
-            }
             Ok(Arc::new(engine))
         }
     }

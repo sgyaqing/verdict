@@ -67,7 +67,7 @@ pub fn normalize(mut manifest: Value) -> Result<Value, String> {
 struct DialectCard {
     template: &'static str,
 
-    recipe: &'static str,
+    family: &'static str,
     slot_rule: &'static str,
     confidence: &'static str,
     rounding: u64,
@@ -77,7 +77,7 @@ struct DialectCard {
 const DIALECT_CARDS: [DialectCard; 2] = [
     DialectCard {
         template: "qev-labels-v2",
-        recipe: "letter_branches",
+        family: "letter_branches",
         slot_rule: "exclusion-256",
         confidence: "uniform-margin",
         rounding: 6,
@@ -86,7 +86,7 @@ const DIALECT_CARDS: [DialectCard; 2] = [
     },
     DialectCard {
         template: "decider-v5",
-        recipe: "letter_readout",
+        family: "letter_readout",
         slot_rule: "single-token-fill-255",
         confidence: "margin-clamp",
         rounding: 4,
@@ -163,6 +163,6 @@ fn resolve_dialect_card(manifest: &mut Value) -> Result<(), String> {
     manifest
         .as_object_mut()
         .expect("root is an object")
-        .insert("family".to_string(), Value::String(card.recipe.to_string()));
+        .insert("family".to_string(), Value::String(card.family.to_string()));
     Ok(())
 }

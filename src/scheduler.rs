@@ -10,6 +10,8 @@ use tokio::time::timeout;
 
 const PROBE_QUANTUM: Duration = Duration::from_micros(500);
 
+const ADMIT_POOL_FACTOR: usize = 4;
+
 pub type RawLogits = crate::engine::EngineRow;
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SchedulerError {
@@ -37,27 +39,24 @@ impl SchedulerConfig {
         queue_cap: usize,
         max_batch_size: usize,
         batch_window_ms: u64,
-        max_len: usize,
+        token_budget: usize,
     ) -> Self {
         Self {
             queue_cap,
             max_batch_size,
             batch_window: Duration::from_millis(batch_window_ms),
-            token_budget: max_batch_size * max_len,
+            token_budget,
         }
     }
-    pub fn validate(&self, max_len: usize) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         if self.queue_cap == 0 {
             return Err("queue_cap must be positive".to_string());
         }
         if self.max_batch_size == 0 {
             return Err("max_batch_size must be positive".to_string());
         }
-        if self.token_budget < max_len {
-            return Err(format!(
-                "token_budget ({}) must be >= max_len ({}) so a single request always fits",
-                self.token_budget, max_len
-            ));
+        if self.token_budget == 0 {
+            return Err("token_budget must be positive".to_string());
         }
         Ok(())
     }
@@ -71,6 +70,10 @@ pub struct ScheduledRequest {
     pub priority: i64,
 
     pub seq: u64,
+
+    pub request: u64,
+
+    pub skips: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -96,6 +99,7 @@ pub struct CollatedBatch {
 pub struct RowMeta {
     pub real_len: usize,
     pub real_k: usize,
+    pub prefix_len: usize,
 }
 
 pub type BatchRunner =
@@ -144,7 +148,11 @@ pub fn collate(items: &[ScheduledRequest], layout: &Layout) -> CollatedBatch {
         media.extend(req.built.media.iter().cloned());
         media_counts.push(req.built.media.len() as i64);
         row_texts.push(req.built.text.clone());
-        rows.push(RowMeta { real_len, real_k });
+        rows.push(RowMeta {
+            real_len,
+            real_k,
+            prefix_len: req.built.prefix_len,
+        });
     }
     CollatedBatch {
         input_ids,
@@ -222,6 +230,77 @@ impl SchedulingPolicy for Priority {
         admit_in_front_order(pending, max_batch_size, token_budget)
     }
 }
+
+fn length_class(buckets: &[usize], len: usize) -> Option<usize> {
+    buckets.iter().copied().find(|&b| len <= b)
+}
+
+pub struct ShapeAware {
+    buckets: Vec<usize>,
+    starve_after: u32,
+}
+
+impl ShapeAware {
+    pub fn new(buckets: Vec<usize>) -> Self {
+        Self {
+            buckets,
+            starve_after: 8,
+        }
+    }
+}
+impl SchedulingPolicy for ShapeAware {
+    fn admit(
+        &self,
+        pending: &mut VecDeque<ScheduledRequest>,
+        max_batch_size: usize,
+        token_budget: usize,
+    ) -> Vec<ScheduledRequest> {
+        if self.buckets.is_empty() {
+            return admit_in_front_order(pending, max_batch_size, token_budget);
+        }
+        let mut items: Vec<ScheduledRequest> = pending
+            .drain(..)
+            .filter(|r| !r.respond.is_closed())
+            .collect();
+        if items.is_empty() {
+            return Vec::new();
+        }
+        let anchor = items
+            .iter()
+            .position(|r| r.skips >= self.starve_after)
+            .unwrap_or(0);
+        let head = items.remove(anchor);
+        let class = length_class(&self.buckets, head.built.ids.len());
+        let request = head.request;
+        let span = class.unwrap_or(head.built.ids.len());
+        let cap_by_tokens = (token_budget / span.max(1)).max(1);
+        let rows_cap = max_batch_size.min(cap_by_tokens).max(1);
+        let mut chosen = Vec::with_capacity(rows_cap);
+        chosen.push(head);
+        let mut rest: Vec<ScheduledRequest> = Vec::with_capacity(items.len());
+        for req in items.drain(..) {
+            let fits = req.request == request && chosen.len() < rows_cap;
+            if fits {
+                chosen.push(req);
+            } else {
+                rest.push(req);
+            }
+        }
+        let mut skipped: Vec<ScheduledRequest> = Vec::with_capacity(rest.len());
+        for mut req in rest.drain(..) {
+            let fits = length_class(&self.buckets, req.built.ids.len()) == class
+                && chosen.len() < rows_cap;
+            if fits {
+                chosen.push(req);
+            } else {
+                req.skips = req.skips.saturating_add(1);
+                skipped.push(req);
+            }
+        }
+        pending.extend(skipped);
+        chosen
+    }
+}
 pub struct SchedulerHandle {
     tx: mpsc::Sender<ScheduledRequest>,
     next_seq: AtomicU64,
@@ -235,6 +314,17 @@ impl SchedulerHandle {
         built: BuiltSequence,
         priority: i64,
     ) -> Result<oneshot::Receiver<Result<RawLogits, SchedulerError>>, SchedulerError> {
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        self.submit_in(seq, task, built, priority)
+    }
+
+    pub fn submit_in(
+        &self,
+        request: u64,
+        task: &str,
+        built: BuiltSequence,
+        priority: i64,
+    ) -> Result<oneshot::Receiver<Result<RawLogits, SchedulerError>>, SchedulerError> {
         let (respond, rx) = oneshot::channel();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         self.tx
@@ -244,6 +334,8 @@ impl SchedulerHandle {
                 respond,
                 priority,
                 seq,
+                request,
+                skips: 0,
             })
             .map_err(|err| match err {
                 TrySendError::Full(_) => SchedulerError::QueueFull,
@@ -265,8 +357,7 @@ pub fn spawn_scheduler(
     runner: BatchRunner,
     replica: usize,
 ) -> Result<SchedulerHandle, SchedulerError> {
-    cfg.validate(layout.max_len)
-        .map_err(SchedulerError::Config)?;
+    cfg.validate().map_err(SchedulerError::Config)?;
     let (tx, rx) = mpsc::channel::<ScheduledRequest>(cfg.queue_cap);
     let (job_tx, job_rx) = mpsc::channel::<Job>(1);
     let join_batching = tokio::spawn(batching_task(cfg, layout, policy, rx, job_tx, replica));
@@ -296,22 +387,34 @@ async fn batching_task(
     let mut open = true;
     let mut permit = None;
     loop {
+        let mut waited_for_slot;
         let held = match permit.take() {
-            Some(held) => held,
-            None => match job_tx.reserve().await {
-                Ok(held) => held,
-                Err(_) => break,
-            },
+            Some(held) => {
+                waited_for_slot = false;
+                held
+            }
+            None => {
+                let before = job_tx.capacity();
+                match job_tx.reserve().await {
+                    Ok(held) => {
+                        waited_for_slot = before == 0;
+                        held
+                    }
+                    Err(_) => break,
+                }
+            }
         };
+        waited_for_slot = waited_for_slot && !pending.is_empty();
         if open && pending.is_empty() {
             match rx.recv().await {
                 Some(req) => pending.push_back(req),
                 None => open = false,
             }
         }
-        if open && pending.len() < cfg.max_batch_size {
+        let fill = cfg.max_batch_size.saturating_mul(ADMIT_POOL_FACTOR);
+        if open && pending.len() < fill && !waited_for_slot {
             let deadline = tokio::time::Instant::now() + cfg.batch_window;
-            while pending.len() < cfg.max_batch_size {
+            while pending.len() < fill {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
                     break;
@@ -346,10 +449,44 @@ async fn batching_task(
     }
 }
 
+type InflightBatch = (
+    Vec<ScheduledRequest>,
+    tokio::task::JoinHandle<Result<Vec<crate::engine::EngineRow>, String>>,
+);
+
 async fn backend_task(runner: BatchRunner, mut job_rx: mpsc::Receiver<Job>) {
-    while let Some(Job { items, batch }) = job_rx.recv().await {
-        let runner = Arc::clone(&runner);
-        let result = tokio::task::spawn_blocking(move || runner(batch)).await;
+    let depth = usize::from(
+        std::env::var("VERDICT_PIPELINE")
+            .map(|v| v != "0")
+            .unwrap_or(true),
+    );
+    let mut inflight: Vec<InflightBatch> = Vec::new();
+    let mut alive = true;
+    while alive || !inflight.is_empty() {
+        while alive && inflight.len() < depth.max(1) {
+            match job_rx.recv().await {
+                Some(Job { items, batch }) => {
+                    let runner = Arc::clone(&runner);
+                    let n = items.len();
+                    let spawned = tokio::task::spawn_blocking(move || {
+                        runner(batch).map(|mut rows| {
+                            rows.truncate(n);
+                            rows
+                        })
+                    });
+                    inflight.push((items, spawned));
+                }
+                None => {
+                    alive = false;
+                    break;
+                }
+            }
+        }
+        if inflight.is_empty() {
+            continue;
+        }
+        let (items, handle) = inflight.remove(0);
+        let result = handle.await;
         match result {
             Ok(Ok(rows)) if rows.len() == items.len() => {
                 for (req, row) in items.into_iter().zip(rows) {

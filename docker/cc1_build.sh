@@ -1,14 +1,8 @@
 #!/bin/bash
-# Build causal-conv1d 1.7.0 from the PyPI sdist inside the image build.
-#
-# PyPI ships no wheel for this package, and transformers' Qwen3.5 path falls
-# back to a reference conv without it (about 10% slower forward time with the
-# kernel enabled). Everything here mirrors the recipe: the pip CUDA-13 nvcc
-# toolchain, the
-# libcudart.so linker-name symlink, and the sm_89 patch (upstream's hardcoded
-# arch list skips Ada and embeds no PTX, so an unpatched wheel would not load
-# on a 4090).
-#
+# Build causal-conv1d 1.7.0 from the PyPI sdist inside the image build: PyPI
+# ships no wheel, and without the kernel transformers' Qwen3.5 path falls back
+# to a reference conv. Upstream's hardcoded arch list skips Ada and embeds no
+# PTX, so an unpatched wheel does not load on a 4090.
 # Runs in a python:3.12-slim-trixie stage with torch==2.14.1+cu130 already
 # installed (the build links against the runtime stage's exact torch).
 set -euo pipefail

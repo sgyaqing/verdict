@@ -1,0 +1,18 @@
+# Verdict convert image: the frozen export stack (base-0.4-convert) plus the
+# verdict binary. The binary embeds the family converters; the image can also
+# serve encoder packages (the engine dlopens the pinned libonnxruntime the
+# base layer already put on the loader path) so download -> convert -> serve
+# runs in one container. Serving deployments should still prefer the lean
+# cpu image; this one exists for conversion, self-check and evaluation.
+#
+# Build (the binary comes prebuilt from target/release):
+#   cp target/release/verdict . && docker buildx build -f Dockerfile.convert \
+#     --platform linux/amd64 -t sgyaqing/verdict:0.4.0-convert --load . && rm -f verdict
+
+FROM sgyaqing/verdict:base-0.4-convert
+
+COPY verdict /usr/local/bin/verdict
+
+WORKDIR /workspace
+ENTRYPOINT ["verdict"]
+CMD ["--help"]

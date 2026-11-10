@@ -3,6 +3,8 @@ Copyright 2026 The Verdict Authors
 
 This product includes design references and reimplemented behaviour from the
 projects listed below. No source code is copied from them unless stated.
+The full text of the Apache License 2.0 covering the projects marked
+Apache License 2.0 below ships as LICENSES/Apache-2.0.txt.
 
 vLLM
 https://github.com/vllm-project/vllm
@@ -20,23 +22,39 @@ Apache License 2.0
 The torch executor's graph runners (GraphRunner, ForkGraphs) are adapted
 from qev's mm_engine.py, with modifications.
 
+vLLM (flash_linear_attention ops)
+https://github.com/vllm-project/vllm
+Apache License 2.0
+Triton kernels vendored into executor/torch_exec.py from
+vllm/third_party/flash_linear_attention/ops: fused_post_conv_prep
+(fused_gdn_prefill_post_conv.py) and the GDN chunk pipeline with its fused
+gated norm (chunk.py, chunk_delta_h.py, chunk_o.py, chunk_scaled_dot_kkt.py,
+cumsum.py, index.py, l2norm.py, op.py, solve_tril.py, utils.py, wy_fast.py,
+fused_norm_gate.py), with vllm-internal imports replaced by local shims.
+
 Laya SDK
 Apache License 2.0
-The marker_head recipe reimplements the official implementation's rendering,
-marker layout and calibration.
+The marker_head family reimplements the official implementation's rendering,
+marker layout, decision head and calibration.
 
 von-sdk
 Apache License 2.0
-The independent_options recipe reimplements the official implementation's
+The independent_options family reimplements the official implementation's
 packing, block-diagonal attention layout and calibration.
 
 decider-ai
 Apache License 2.0
-The letter_readout recipe reimplements the official implementation's rendering,
+The letter_readout family reimplements the official implementation's rendering,
 readout positions and calibration.
 
 TypeSafe SDK
-Confidence formulas used by the letter_branches recipe.
+Confidence formulas used by the letter_branches family.
+
+receptron/laya
+https://github.com/receptron/laya
+MIT License (full text: LICENSES/MIT-Receptron.txt)
+The marker_head family's converter is written for Verdict from the official
+export path and model definition; convert/marker_head/ carries it.
 
 MIT License
 

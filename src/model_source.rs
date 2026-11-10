@@ -83,7 +83,7 @@ impl Hub {
         }
     }
 
-    fn slug(&self) -> &'static str {
+    pub fn slug(&self) -> &'static str {
         match self.backend {
             HubBackend::Hf => "huggingface",
             HubBackend::ModelScope => "modelscope",
@@ -367,10 +367,15 @@ pub fn resolve_backend(spec: &str, backend: HubBackend) -> Result<PathBuf, Strin
     resolve_with(spec, backend, false)
 }
 fn resolve_with(spec: &str, backend: HubBackend, force: bool) -> Result<PathBuf, String> {
+    if Path::new(spec).is_dir() {
+        return resolve_local(Path::new(spec));
+    }
     let (base, tag) = split_spec(spec)?;
-    let local = Path::new(base);
-    if local.is_dir() {
-        return resolve_local(local, tag.as_deref());
+    if Path::new(base).is_dir() {
+        return Err(format!(
+            "{base} is a local directory; variant tags are for repo ids \
+             -- serve the package directory itself"
+        ));
     }
     if is_repo_id(base) {
         return download(
@@ -385,7 +390,7 @@ fn resolve_with(spec: &str, backend: HubBackend, force: bool) -> Result<PathBuf,
     ))
 }
 
-fn resolve_local(dir: &Path, tag: Option<&str>) -> Result<PathBuf, String> {
+fn resolve_local(dir: &Path) -> Result<PathBuf, String> {
     let has_manifest = dir.join("model.json").is_file();
     let has_index = dir.join(VARIANTS_INDEX).is_file();
     match (has_manifest, has_index) {
@@ -394,42 +399,21 @@ fn resolve_local(dir: &Path, tag: Option<&str>) -> Result<PathBuf, String> {
              plain or a variant family, not both",
             dir.display()
         )),
-        (true, false) => match tag {
-            None => Ok(dir.to_path_buf()),
-            Some(v) => Err(format!(
-                "{} has no variants (its model.json is a plain package); \
-                 serve it without :{v}",
-                dir.display()
-            )),
-        },
+        (true, false) => Ok(dir.to_path_buf()),
         (false, true) => {
             let index_path = dir.join(VARIANTS_INDEX);
             let raw = std::fs::read_to_string(&index_path)
                 .map_err(|err| format!("read {}: {err}", index_path.display()))?;
             let variants = parse_variants_index(&raw, &dir.display().to_string())?;
-            let Some(v) = tag else {
-                return Err(variant_listing(
-                    &dir.display().to_string(),
-                    &variants,
-                    |name| dir.join(name).join(COMPLETE).is_file(),
-                ));
-            };
-            if !variants.iter().any(|name| name == v) {
-                return Err(format!(
-                    "unknown variant {v:?} for {} (available: {})",
-                    dir.display(),
-                    variants.join(", ")
-                ));
-            }
-            let sub = dir.join(v);
-            if !sub.join("model.json").is_file() {
-                return Err(format!(
-                    "variant {v:?} of {} has no model.json in {}",
-                    dir.display(),
-                    sub.display()
-                ));
-            }
-            Ok(sub)
+            let lines: Vec<String> = variants
+                .iter()
+                .map(|name| format!("  {}", dir.join(name).display()))
+                .collect();
+            Err(format!(
+                "{} is a local variant family; serve one of its subdirectories:\n{}",
+                dir.display(),
+                lines.join("\n")
+            ))
         }
         (false, false) => Ok(dir.to_path_buf()),
     }
@@ -574,9 +558,132 @@ fn fetch_package_body(
 }
 
 const COMPLETE: &str = ".complete";
+const DOWNLOADING: &str = ".download";
 fn write_complete(dir: &Path) -> Result<(), String> {
     std::fs::write(dir.join(COMPLETE), b"")
         .map_err(|err| format!("marking {} complete: {err}", dir.display()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadTarget {
+    Fresh,
+    Resume,
+    Done,
+}
+
+fn read_download_marker(dir: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(dir.join(DOWNLOADING)).ok()?;
+    let trimmed = raw.trim().to_owned();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+pub fn download_target_state(dir: &Path, repo: &str) -> Result<DownloadTarget, String> {
+    if !dir.exists() {
+        return Ok(DownloadTarget::Fresh);
+    }
+    if !dir.is_dir() {
+        return Err(format!("{} exists and is not a directory", dir.display()));
+    }
+    let empty = std::fs::read_dir(dir)
+        .map_err(|err| format!("read {}: {err}", dir.display()))?
+        .next()
+        .is_none();
+    match read_download_marker(dir) {
+        Some(marker) if marker == repo => {
+            if dir.join(COMPLETE).is_file() {
+                Ok(DownloadTarget::Done)
+            } else {
+                Ok(DownloadTarget::Resume)
+            }
+        }
+        Some(marker) => Err(format!(
+            "{} holds a download of {marker:?}; refusing to reuse it for {repo:?} -- \
+             point the download at another directory or clear this one",
+            dir.display()
+        )),
+        None if empty => Ok(DownloadTarget::Fresh),
+        None => Err(format!(
+            "{} is not empty and carries no download marker; the download only fills \
+             a missing or empty directory",
+            dir.display()
+        )),
+    }
+}
+
+pub fn download_command(repo: &str, dest: &Path) -> Result<(), String> {
+    if let Some((head, tag)) = repo.split_once(':')
+        && is_repo_id(head)
+    {
+        return Err(format!(
+            "download fetches whole repos and takes no variant tag; \
+             `verdict serve {head}:{tag}` handles variants"
+        ));
+    }
+    if Path::new(repo).is_dir() {
+        return Err(format!(
+            "{repo} is a local directory; download fetches a hub repo id (<org>/<name>)"
+        ));
+    }
+    if !is_repo_id(repo) {
+        return Err(format!(
+            "{repo:?} is not a hub repo id (expected <org>/<name>)"
+        ));
+    }
+    match download_target_state(dest, repo)? {
+        DownloadTarget::Done => {
+            tracing::info!(repo, dest = %dest.display(), "already downloaded; nothing to do");
+            return Ok(());
+        }
+        DownloadTarget::Fresh => {
+            std::fs::create_dir_all(dest)
+                .map_err(|err| format!("create {}: {err}", dest.display()))?;
+            std::fs::write(dest.join(DOWNLOADING), repo)
+                .map_err(|err| format!("write {}: {err}", dest.join(DOWNLOADING).display()))?;
+        }
+        DownloadTarget::Resume => {
+            tracing::info!(repo, dest = %dest.display(), "resuming the interrupted download");
+        }
+    }
+    let hub = Hub::for_backend(HubBackend::from_env());
+    let branch = hub.default_branch();
+    let files: Vec<String> = hub
+        .list_repo_files(repo, branch)?
+        .into_iter()
+        .filter(|f| {
+            !Path::new(f)
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with('.'))
+                .unwrap_or(false)
+        })
+        .collect();
+    if files.is_empty() {
+        return Err(format!("the repo {repo} listed no files"));
+    }
+    crate::progress::repo_start(repo, hub.slug(), &dest.display().to_string(), files.len());
+    let started = std::time::Instant::now();
+    for file in &files {
+        hub.get(repo, branch, file, dest)?;
+    }
+    write_complete(dest)?;
+    let mut bytes = 0u64;
+    for file in &files {
+        bytes += std::fs::metadata(dest.join(file))
+            .map(|m| m.len())
+            .unwrap_or(0);
+    }
+    crate::progress::repo_done(repo, files.len(), bytes, started.elapsed().as_secs());
+    tracing::info!(
+        repo,
+        files = files.len(),
+        bytes,
+        dest = %dest.display(),
+        "download complete"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -797,6 +904,25 @@ fn missing_weight_shards(dir: &Path) -> Result<Vec<String>, String> {
     Ok(missing)
 }
 
+pub fn compile_cache_root(resolved: &Path, spec: &str) -> PathBuf {
+    let base = match split_spec(spec) {
+        Ok((base, _)) => base,
+        Err(_) => spec,
+    };
+    if Path::new(base).is_dir() {
+        return Path::new(base).join("compile");
+    }
+    let cache_root = verdict_cache_root();
+    let pkg = resolved
+        .strip_prefix(&cache_root)
+        .ok()
+        .and_then(|rel| rel.components().next())
+        .map(|c| c.as_os_str().to_owned())
+        .or_else(|| resolved.file_name().map(|n| n.to_owned()))
+        .unwrap_or_default();
+    cache_root.join(pkg).join("compile")
+}
+
 pub fn verdict_cache_root() -> PathBuf {
     if let Ok(dir) = std::env::var("VERDICT_CACHE") {
         return PathBuf::from(dir);
@@ -916,13 +1042,20 @@ fn download_body(
         .header("content-length")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
-    let pb = indicatif::ProgressBar::new(total);
     let name = dest
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    pb.set_message(name.clone());
-    let started = std::time::Instant::now();
+    let mut file_progress = crate::progress::FileProgress::new(&name, total);
+    let pb = if crate::progress::mode() == crate::progress::Mode::Json {
+        indicatif::ProgressBar::with_draw_target(
+            Some(total),
+            indicatif::ProgressDrawTarget::hidden(),
+        )
+    } else {
+        indicatif::ProgressBar::new(total)
+    };
+    pb.set_message(name);
     let mut reader = response.into_reader();
     let mut file = std::fs::File::create(part)
         .map_err(|err| FetchErr::Terminal(format!("create {}: {err}", part.display())))?;
@@ -948,14 +1081,9 @@ fn download_body(
         std::io::Write::write_all(&mut file, &buf[..n])
             .map_err(|err| FetchErr::Terminal(format!("write: {err}")))?;
         pb.inc(n as u64);
+        file_progress.tick(n as u64);
     }
     pb.finish();
-    tracing::info!(
-        file = %name,
-        bytes = pb.position(),
-        secs = started.elapsed().as_secs(),
-        "downloaded"
-    );
     drop(file);
     std::fs::rename(part, dest).map_err(|err| {
         FetchErr::Terminal(format!(
@@ -963,5 +1091,7 @@ fn download_body(
             part.display(),
             dest.display()
         ))
-    })
+    })?;
+    file_progress.finish();
+    Ok(())
 }

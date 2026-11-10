@@ -9,6 +9,10 @@
 !Cargo.lock
 !src
 !executor
+!convert
 !docker/cc1_build.sh
 !LICENSE
 !NOTICE
+!LICENSES
+!verdict
+!cv-wheels

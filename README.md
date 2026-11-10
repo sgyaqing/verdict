@@ -10,22 +10,24 @@ Up to **66x** the throughput of the model authors' own servers, with the same an
 <summary><strong>OneJev1.6-9b</strong></summary>
 
 <p align="center">
-  <img src="assets/bench-onejev-9b-text-tp.svg" alt="OneJev1.6-9b text throughput vs concurrency, RTX 4090" width="49%">
-  <img src="assets/bench-onejev-9b-text-lat.svg" alt="OneJev1.6-9b text P99 latency vs concurrency, RTX 4090" width="49%">
+  <img src="assets/bench-onejev-9b-text-tp.svg" alt="OneJev1.6-9b text throughput vs concurrency, A100 80 GB" width="49%">
+  <img src="assets/bench-onejev-9b-text-lat.svg" alt="OneJev1.6-9b text P99 latency vs concurrency, A100 80 GB" width="49%">
   <br><b>text</b>
 </p>
 
 <p align="center">
-  <img src="assets/bench-onejev-9b-image-tp.svg" alt="OneJev1.6-9b image throughput vs concurrency, RTX 4090" width="49%">
-  <img src="assets/bench-onejev-9b-image-lat.svg" alt="OneJev1.6-9b image P99 latency vs concurrency, RTX 4090" width="49%">
+  <img src="assets/bench-onejev-9b-image-tp.svg" alt="OneJev1.6-9b image throughput vs concurrency, A100 80 GB" width="49%">
+  <img src="assets/bench-onejev-9b-image-lat.svg" alt="OneJev1.6-9b image P99 latency vs concurrency, A100 80 GB" width="49%">
   <br><b>image</b>
 </p>
 
 <p align="center">
-  <img src="assets/bench-onejev-9b-video-tp.svg" alt="OneJev1.6-9b video throughput vs concurrency, RTX 4090" width="49%">
-  <img src="assets/bench-onejev-9b-video-lat.svg" alt="OneJev1.6-9b video P99 latency vs concurrency, RTX 4090" width="49%">
+  <img src="assets/bench-onejev-9b-video-tp.svg" alt="OneJev1.6-9b video throughput vs concurrency, A100 80 GB" width="49%">
+  <img src="assets/bench-onejev-9b-video-lat.svg" alt="OneJev1.6-9b video P99 latency vs concurrency, A100 80 GB" width="49%">
   <br><b>video</b>
 </p>
+
+`qev` did not pass the video test at concurrency 64, so its value is n/a.
 
 </details>
 
@@ -33,8 +35,8 @@ Up to **66x** the throughput of the model authors' own servers, with the same an
 <summary><strong>decider-2b</strong></summary>
 
 <p align="center">
-  <img src="assets/bench-decider-gpu-tp.svg" alt="decider-2b throughput vs concurrency, RTX 4090" width="49%">
-  <img src="assets/bench-decider-gpu-lat.svg" alt="decider-2b P99 latency vs concurrency, RTX 4090" width="49%">
+  <img src="assets/bench-decider-gpu-tp.svg" alt="decider-2b mixed throughput vs concurrency, RTX 4090 24 GB" width="49%">
+  <img src="assets/bench-decider-gpu-lat.svg" alt="decider-2b mixed P99 latency vs concurrency, RTX 4090 24 GB" width="49%">
   <br><b>GPU only</b>
 </p>
 
@@ -44,8 +46,8 @@ Up to **66x** the throughput of the model authors' own servers, with the same an
 <summary><strong>von</strong></summary>
 
 <p align="center">
-  <img src="assets/bench-von-gpu-tp.svg" alt="von throughput vs concurrency, RTX 4090" width="49%">
-  <img src="assets/bench-von-gpu-lat.svg" alt="von P99 latency vs concurrency, RTX 4090" width="49%">
+  <img src="assets/bench-von-gpu-tp.svg" alt="von throughput vs concurrency, RTX 4090 24 GB" width="49%">
+  <img src="assets/bench-von-gpu-lat.svg" alt="von P99 latency vs concurrency, RTX 4090 24 GB" width="49%">
   <br><b>GPU</b>
 </p>
 
@@ -61,8 +63,8 @@ Up to **66x** the throughput of the model authors' own servers, with the same an
 <summary><strong>laya-multilingual</strong></summary>
 
 <p align="center">
-  <img src="assets/bench-laya-ml-gpu-tp.svg" alt="laya-multilingual throughput vs concurrency, RTX 4090" width="49%">
-  <img src="assets/bench-laya-ml-gpu-lat.svg" alt="laya-multilingual P99 latency vs concurrency, RTX 4090" width="49%">
+  <img src="assets/bench-laya-ml-gpu-tp.svg" alt="laya-multilingual throughput vs concurrency, RTX 4090 24 GB" width="49%">
+  <img src="assets/bench-laya-ml-gpu-lat.svg" alt="laya-multilingual P99 latency vs concurrency, RTX 4090 24 GB" width="49%">
   <br><b>GPU</b>
 </p>
 
@@ -80,8 +82,8 @@ The official server refused requests at concurrency 64, so its line ends at conc
 <summary><strong>laya</strong></summary>
 
 <p align="center">
-  <img src="assets/bench-laya-gpu-tp.svg" alt="laya throughput vs concurrency, RTX 4090" width="49%">
-  <img src="assets/bench-laya-gpu-lat.svg" alt="laya P99 latency vs concurrency, RTX 4090" width="49%">
+  <img src="assets/bench-laya-gpu-tp.svg" alt="laya throughput vs concurrency, RTX 4090 24 GB" width="49%">
+  <img src="assets/bench-laya-gpu-lat.svg" alt="laya P99 latency vs concurrency, RTX 4090 24 GB" width="49%">
   <br><b>GPU</b>
 </p>
 
@@ -129,6 +131,8 @@ curl -s localhost:8080/v1/choice -H 'content-type: application/json' -d '{
 | [`verdict-models/laya-multilingual`](https://huggingface.co/verdict-models/laya-multilingual) | 100+ languages | `verdict serve verdict-models/laya-multilingual` |
 | [`verdict-models/laya`](https://huggingface.co/verdict-models/laya) | English | `verdict serve verdict-models/laya` |
 
+Any checkpoint of the laya (laya-multilingual included) and von families also serves — the laya authors' [typed-decisions](https://huggingface.co/convaiinnovations/laya-typed-decisions) checkpoint, a fine-tune, a newer revision — after a one-time conversion; see **Conversion**.
+
 All five are also mirrored on ModelScope, in the `sgyaqing` namespace:
 
 ```bash
@@ -158,7 +162,30 @@ available:
 example: verdict serve verdict-models/OneJev1.6:0.8b
 ```
 
-The same `:variant` syntax works for a family directory served by local path.
+A family served from a local path is served by its variant subdirectory: `verdict serve ~/models/OneJev1.6/9b`.
+
+## Conversion
+
+The table above lists the Verdict-ready packages we publish. Conversion covers encoder models only, and this release converts two families: laya (laya-multilingual included) and von. Any checkpoint of these families — a fine-tune, a newer revision — can become one: `verdict convert` turns it into a Verdict-ready package.
+
+The conversion runs in two steps, both in the verdict-convert image: `verdict download` fetches the checkpoint to local disk first, then `verdict convert` turns it into a package.
+
+This example converts the laya authors' typed-decisions checkpoint, which ships as a checkpoint but has no Verdict-ready package:
+
+```bash
+# fetch the checkpoint
+docker run --rm -v ~/models:/work sgyaqing/verdict:latest-convert \
+    download convaiinnovations/laya-typed-decisions /work/laya-typed
+
+# convert it into a Verdict-ready package
+docker run --rm -v ~/models:/work sgyaqing/verdict:latest-convert \
+    convert /work/laya-typed /work/laya-typed-output
+
+# serve it like any Verdict-ready model
+docker run --rm --gpus all -p 8080:8080 \
+    -v ~/models/laya-typed-output:/model \
+    sgyaqing/verdict:latest-cuda serve /model --host 0.0.0.0
+```
 
 ## API
 
@@ -282,7 +309,7 @@ curl -s localhost:8080/v1/decisions -H 'content-type: application/json' -d '{
      "choices": [{"value": "circle"}, {"value": "rectangle"}, {"value": "none"}]}]}'
 ```
 
-Verdict 0.3 accepts text and images on `/v1/decisions`, but not video.
+Verdict accepts text and images on `/v1/decisions`, but not video.
 
 With the official `openai` SDK (>= 3.26):
 
@@ -314,8 +341,6 @@ One question per call; text only.
 | `POST /v1/choice` | `{"question": "Dinner tonight?", "state": "Fridge is empty, it's late.", "options": ["order delivery", "cook pasta"]}` | `{"choice":1,"probabilities":[0.0963,0.9037],"usage":{"input_tokens":25},"latency_ms":22}` |
 | `POST /v1/score` | `{"question": "How polite is this reply?", "state": "Support reply: we refunded your order, sorry for the trouble.", "levels": ["terse", "neutral", "warm"]}` | `{"score":0.7665,"probabilities":[0.2348,0.7639,0.0013],"usage":{"input_tokens":44},"latency_ms":26}` |
 | `POST /v1/noul` | `{"claim": "The customer got their money back", "state": "Support reply: we refunded your order, sorry for the trouble."}` | `{"probability":0.9587,"usage":{"input_tokens":45},"latency_ms":25}` |
-| `GET /health` | | `{"status":"ok","version":"0.3.0"}` |
-| `GET /metrics` | | Prometheus text, not JSON: `verdict_requests_total{task="choice"} 1` … |
 
 ### OpenAI-compatible layer
 
@@ -339,6 +364,40 @@ print(r.model_extra["verdict"])       # {"choice": 2, "probabilities": [...]}
 
 Decision fields ride as top-level extensions via `extra_body`; whichever is present picks the task: `options` → choice, `levels` → score, `claim` → noul. Text only.
 
+### `/health` and `/metrics`
+
+`GET /health` answers `{"status":"ok","version":"0.4.0"}` once every engine replica is serving, and a 503 with `{"status":"unavailable", ...}` while any replica is unhealthy. The first boot may compile for minutes before its first ok — poll this endpoint and read earlier silence as loading, not failure.
+
+`GET /metrics` serves Prometheus text:
+
+```text
+verdict_requests_total{task="choice"} 153
+verdict_queue_depth{replica="0"} 7
+```
+
+Six families: `verdict_requests_total{task}` and `verdict_decision_latency_seconds{task}` count and time served decisions; `verdict_queue_depth{replica}` and `verdict_in_flight` gauge queued and executing requests; `verdict_batch_rows{replica}` and `verdict_batches_total` describe batch fullness. For tuning, read `verdict_queue_depth` together with `/graph` (see **Optimization**).
+
+### `/graph`
+
+Coverage report for the CUDA graphs: which graph cells boot planned and captured, which served rows missed a graph and why, and the GPU memory budget the instance runs under.
+
+```json
+{
+  "envelope": {"max_len": 1024, "max_rows": 16, "fork_max_prefix": 4096, "fork_max_width": 64,
+               "gpu_memory_utilization": 0.92, "budget_bytes": 23697524942,
+               "reserved_bytes": 6442450944, "transient_bytes": 1073741824},
+  "cells": {"text": {"captured": 60, "planned": 60},
+            "media": {"captured": 5, "planned": 5},
+            "fork": {"captured": 128, "planned": 128}},
+  "served_rows": 40213,
+  "eager": {"total": 0.0, "len": 0.0, "rows": 0.0, "degraded": 0.0},
+  "fork": {"total": 0.0, "prefix": 0.0, "width": 0.0, "rows": 0.0, "degraded": 0.0, "not_applicable": 0.0},
+  "replicas": 1
+}
+```
+
+For acting on these numbers see **Optimization**.
+
 ### Errors
 
 All errors share one JSON structure -- sending one option to `/v1/choice`, for example:
@@ -357,10 +416,12 @@ All errors share one JSON structure -- sending one option to `/v1/choice`, for e
 
 ## Performance
 
-All numbers measured on one machine (RTX 4090, AMD EPYC 7543) — except OneJev1.6-27b, measured on one A100 (80 GB), and decider-2b, measured on a second RTX 4090 host (48 GB) — end to end over HTTP, each model against its author's own server (`laya-serve` 0.4.7, `von serve` from von-sdk 1.3.7, `decider.serve` from decider-ai 1.9.0, `qev` 0.1.4 for OneJev1.6). CPU measurements were taken on the same host with the GPU idle. A ratio above 1x means Verdict is ahead. Servers run with their default flags unless a table notes otherwise — the parameters behind every published number are named next to it. Click a model to expand its tables. OneJev1.6 and decider-2b cells are 10-second duration windows after a warm matrix.
+All numbers measured end to end over HTTP, each model against its author's own server on the host named in its heading (`laya-serve` 0.4.7, `von serve` from von-sdk 1.3.7, `decider.serve_vllm` from decider-ai 1.9.0 on vLLM 0.29.0, `qev` 0.1.4 for OneJev1.6). CPU measurements were taken on the same host with the GPU idle. A ratio above 1x means Verdict is ahead. Servers run with their default parameters unless a model's section notes otherwise. Click a model to expand its tables. The laya, von and laya-multilingual cells were measured with a fixed-count method: 300, 800 and 6400 requests at concurrency 1, 8 and 64, with `--max-batch-size 8`. OneJev1.6 cells are a 10-second run after warm-up at that concurrency; decider-2b cells are a 30-second run, the first 10 seconds discarded as warm-up (the opening seconds are the queue filling, not steady state); for both, throughput is the number of completed responses inside the window divided by its length, and a cell is reported only if the server sustained at least two full rounds of its concurrency.
 
 <details>
-<summary><strong>OneJev1.6-0.8b</strong></summary>
+<summary><strong>OneJev1.6-0.8b</strong> (RTX 4090 48 GB)</summary>
+
+All cells with `--max-batch-size 8 --graph-max-len 512` except concurrency-1 cells with `--max-batch-size 2 --batch-window-ms 1`.
 
 **text**
 
@@ -389,7 +450,9 @@ All numbers measured on one machine (RTX 4090, AMD EPYC 7543) — except OneJev1
 </details>
 
 <details>
-<summary><strong>OneJev1.6-4b</strong></summary>
+<summary><strong>OneJev1.6-4b</strong> (RTX 4090 48 GB)</summary>
+
+All cells with `--max-batch-size 8 --graph-max-len 512` except concurrency-1 cells with `--max-batch-size 2 --batch-window-ms 1`.
 
 **text**
 
@@ -418,80 +481,84 @@ All numbers measured on one machine (RTX 4090, AMD EPYC 7543) — except OneJev1
 </details>
 
 <details open>
-<summary><strong>OneJev1.6-9b</strong></summary>
+<summary><strong>OneJev1.6-9b</strong> (A100 80 GB)</summary>
 
 **text**
 
 | concurrency | Verdict&nbsp;rps | `qev`&nbsp;rps | rps&nbsp;ratio | Verdict&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | `qev`&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | P50&nbsp;/&nbsp;P99&nbsp;ratio |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 23.8 | 20.9 | 1.14x | 42.28&nbsp;/&nbsp;43.17 | 47.76&nbsp;/&nbsp;48.04 | 1.13x&nbsp;/&nbsp;1.11x |
-| 8 | 28.4 | 21.0 | 1.35x | 281.16&nbsp;/&nbsp;285.22 | 380.48&nbsp;/&nbsp;380.88 | 1.35x&nbsp;/&nbsp;1.34x |
-| 64 | 28.5 | 21.0 | 1.36x | 2244.50&nbsp;/&nbsp;2249.60 | 3044.40&nbsp;/&nbsp;3065.40 | 1.36x&nbsp;/&nbsp;1.36x |
+| 1 | 25.3 | 24.4 | 1.04x | 39.63&nbsp;/&nbsp;40.51 | 40.91&nbsp;/&nbsp;41.30 | 1.03x&nbsp;/&nbsp;1.02x |
+| 8 | 36.0 | 24.0 | 1.50x | 218.55&nbsp;/&nbsp;221.13 | 324.49&nbsp;/&nbsp;342.35 | 1.48x&nbsp;/&nbsp;1.55x |
+| 64 | 35.8 | 19.2 | 1.86x | 1783.20&nbsp;/&nbsp;2094.50 | 2591.80&nbsp;/&nbsp;2672.30 | 1.45x&nbsp;/&nbsp;1.28x |
 
 **image**
 
 | concurrency | Verdict&nbsp;rps | `qev`&nbsp;rps | rps&nbsp;ratio | Verdict&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | `qev`&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | P50&nbsp;/&nbsp;P99&nbsp;ratio |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 12.4 | 12.5 | 1.00x | 80.33&nbsp;/&nbsp;83.66 | 80.02&nbsp;/&nbsp;86.61 | 1.00x&nbsp;/&nbsp;1.04x |
-| 8 | 20.3 | 12.6 | 1.62x | 224.80&nbsp;/&nbsp;1010.90 | 636.24&nbsp;/&nbsp;637.31 | 2.83x&nbsp;/&nbsp;0.63x |
-| 64 | 29.0 | 12.4 | 2.33x | 792.10&nbsp;/&nbsp;1716.60 | 4013.70&nbsp;/&nbsp;4014.40 | 5.07x&nbsp;/&nbsp;2.34x |
+| 1 | 21.2 | 13.3 | 1.59x | 43.42&nbsp;/&nbsp;45.08 | 74.44&nbsp;/&nbsp;75.36 | 1.71x&nbsp;/&nbsp;1.67x |
+| 8 | 22.2 | 13.6 | 1.63x | 374.78&nbsp;/&nbsp;422.07 | 587.00&nbsp;/&nbsp;592.19 | 1.57x&nbsp;/&nbsp;1.40x |
+| 64 | 20.9 | 12.8 | 1.63x | 2868.40&nbsp;/&nbsp;2938.60 | 5257.50&nbsp;/&nbsp;5259.70 | 1.83x&nbsp;/&nbsp;1.79x |
 
 **video**
 
 | concurrency | Verdict&nbsp;rps | `qev`&nbsp;rps | rps&nbsp;ratio | Verdict&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | `qev`&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | P50&nbsp;/&nbsp;P99&nbsp;ratio |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 11.2 | 11.3 | 0.99x | 88.76&nbsp;/&nbsp;98.35 | 87.95&nbsp;/&nbsp;91.22 | 0.99x&nbsp;/&nbsp;0.93x |
-| 8 | 32.1 | 11.3 | 2.84x | 242.53&nbsp;/&nbsp;250.81 | 707.92&nbsp;/&nbsp;719.27 | 2.92x&nbsp;/&nbsp;2.87x |
-| 64 | 25.3 | 11.4 | 2.22x | 848.00&nbsp;/&nbsp;1977.00 | 4388.30&nbsp;/&nbsp;4389.50 | 5.17x&nbsp;/&nbsp;2.22x |
+| 1 | 19.2 | 11.8 | 1.63x | 51.77&nbsp;/&nbsp;56.12 | 83.68&nbsp;/&nbsp;87.75 | 1.62x&nbsp;/&nbsp;1.56x |
+| 8 | 20.5 | 12.1 | 1.69x | 381.89&nbsp;/&nbsp;461.59 | 645.15&nbsp;/&nbsp;652.86 | 1.69x&nbsp;/&nbsp;1.41x |
+| 64 | 19.3 | n/a&nbsp;&dagger; | &mdash; | 3099.90&nbsp;/&nbsp;3347.90 | &mdash; | &mdash; |
+
+&dagger; `qev` completed one round of the 64 clients inside the window, the rest in flight at the deadline, so the cell is n/a.
 
 </details>
 
 <details>
 <summary><strong>OneJev1.6-27b</strong> (A100 80 GB)</summary>
 
+Verdict runs this tier eager (`VERDICT_TORCH_GRAPHS=0`): the CUDA graphs do fit the 80 GB card, but their static pools leave no room for batch capacity, and media throughput at concurrency 8 and 64 drops by roughly two thirds. The same tier was eager in the 0.3.0 numbers, so the two releases are directly comparable.
+
 **text**
 
 | concurrency | Verdict&nbsp;rps | `qev`&nbsp;rps | rps&nbsp;ratio | Verdict&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | `qev`&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | P50&nbsp;/&nbsp;P99&nbsp;ratio |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 9.8 | 8.5 | 1.15x | 102.31&nbsp;/&nbsp;103.45 | 117.76&nbsp;/&nbsp;120.00 | 1.15x&nbsp;/&nbsp;1.16x |
-| 8 | 12.9 | 9.1 | 1.42x | 640.28&nbsp;/&nbsp;736.38 | 940.88&nbsp;/&nbsp;942.44 | 1.47x&nbsp;/&nbsp;1.28x |
-| 64 | 17.6 | 12.8 | 1.37x | 5095.90&nbsp;/&nbsp;5592.40 | 8209.50&nbsp;/&nbsp;8210.10 | 1.61x&nbsp;/&nbsp;1.47x |
+| 1 | 9.1 | 8.5 | 1.07x | 109.02&nbsp;/&nbsp;111.21 | 116.80&nbsp;/&nbsp;118.43 | 1.07x&nbsp;/&nbsp;1.06x |
+| 8 | 12.0 | 8.0 | 1.50x | 655.60&nbsp;/&nbsp;658.29 | 933.53&nbsp;/&nbsp;966.40 | 1.42x&nbsp;/&nbsp;1.47x |
+| 64 | 11.2 | n/a&nbsp;&dagger; | &mdash; | 4466.50&nbsp;/&nbsp;5737.10 | &mdash; | &mdash; |
 
 **image**
 
 | concurrency | Verdict&nbsp;rps | `qev`&nbsp;rps | rps&nbsp;ratio | Verdict&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | `qev`&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | P50&nbsp;/&nbsp;P99&nbsp;ratio |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 5.7 | 2.5 | 2.28x | 178.32&nbsp;/&nbsp;180.22 | 177.50&nbsp;/&nbsp;5888.90 | 1.00x&nbsp;/&nbsp;32.7x |
-| 8 | 14.3 | 5.6 | 2.55x | 555.69&nbsp;/&nbsp;729.59 | 1416.60&nbsp;/&nbsp;1529.50 | 2.55x&nbsp;/&nbsp;2.10x |
-| 64 | 20.0 | n/a&nbsp;&dagger; | &mdash; | 4457.90&nbsp;/&nbsp;4884.30 | &mdash; | &mdash; |
+| 1 | 4.0 | 5.6 | 0.71x | 244.69&nbsp;/&nbsp;248.87 | 175.06&nbsp;/&nbsp;179.04 | 0.72x&nbsp;/&nbsp;0.72x |
+| 8 | 17.6 | 5.6 | 3.14x | 447.61&nbsp;/&nbsp;454.15 | 1400.20&nbsp;/&nbsp;1401.90 | 3.13x&nbsp;/&nbsp;3.09x |
+| 64 | 16.7 | n/a&nbsp;&dagger; | &mdash; | 3528.60&nbsp;/&nbsp;3934.30 | &mdash; | &mdash; |
 
 **video**
 
 | concurrency | Verdict&nbsp;rps | `qev`&nbsp;rps | rps&nbsp;ratio | Verdict&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | `qev`&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | P50&nbsp;/&nbsp;P99&nbsp;ratio |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 5.3 | 5.4 | 0.98x | 188.07&nbsp;/&nbsp;208.21 | 184.72&nbsp;/&nbsp;190.44 | 0.98x&nbsp;/&nbsp;0.91x |
-| 8 | 14.4 | 6.0 | 2.40x | 574.03&nbsp;/&nbsp;579.80 | 1487.60&nbsp;/&nbsp;1496.60 | 2.59x&nbsp;/&nbsp;2.58x |
-| 64 | 19.5 | n/a&nbsp;&dagger; | &mdash; | 4572.40&nbsp;/&nbsp;4861.90 | &mdash; | &mdash; |
+| 1 | 3.9 | 5.2 | 0.75x | 252.52&nbsp;/&nbsp;273.82 | 183.82&nbsp;/&nbsp;317.76 | 0.73x&nbsp;/&nbsp;1.16x |
+| 8 | 16.8 | 4.8 | 3.50x | 455.36&nbsp;/&nbsp;569.37 | 1476.50&nbsp;/&nbsp;1578.80 | 3.24x&nbsp;/&nbsp;2.77x |
+| 64 | 17.1 | n/a&nbsp;&dagger; | &mdash; | 3620.80&nbsp;/&nbsp;4005.50 | &mdash; | &mdash; |
 
-At image and video `c=64`, `qev` completed **zero** responses inside the 10-second window: under sustained load its queue bleeds over from the preceding cell and never drains, so every request was still in flight at the deadline (the per-request timeout is 60&nbsp;s — nothing errored). Those `qev` cells are therefore reported as n/a, not as a measured zero. For reference, a supplementary run from a drained queue with an extended per-request timeout collected 23 and 8 responses (8.7 and 7.2 rps; P50/P99 2883.3/4128.1 and 1523.2/1523.3 ms) — a recovery-condition estimate, not the sustained-load protocol result, so no ratios are derived from it. `qev`'s image `c=1` P99 reflects a stall inside its own window (its P50 there is 177.5 ms).
+&dagger; At `c=64`, `qev` cannot carry the offered concurrency: it completed 64, 8 and 0 responses in the text, image and video cells — the rest in flight at the deadline, so all three cells are n/a.
 
 </details>
 
 <details open>
-<summary><strong>decider-2b</strong></summary>
+<summary><strong>decider-2b</strong> (RTX 4090 24 GB)</summary>
 
 **GPU**
 
-| concurrency | Verdict&nbsp;rps | `decider.serve`&nbsp;rps | rps&nbsp;ratio | Verdict&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | `decider.serve`&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | P50&nbsp;/&nbsp;P99&nbsp;ratio |
-|---|---:|---:|---:|---:|---:|---:|
-| 1 | 140.1 | 136.6 | 1.03x | 6.90&nbsp;/&nbsp;7.89 | 7.29&nbsp;/&nbsp;7.74 | 1.06&nbsp;/&nbsp;0.98x |
-| 8 | 620.7 | 332.5 | 1.87x | 12.88&nbsp;/&nbsp;13.76 | 23.91&nbsp;/&nbsp;29.22 | 1.86&nbsp;/&nbsp;2.12x |
-| 64 | 672.6 | 596.1 | 1.13x | 95.89&nbsp;/&nbsp;97.93 | 95.36&nbsp;/&nbsp;303.14 | 1.00&nbsp;/&nbsp;3.09x |
+| concurrency | Verdict&nbsp;rps | `decider.serve_vllm`&nbsp;rps | rps&nbsp;ratio | Verdict&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | `decider.serve_vllm`&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | P50&nbsp;/&nbsp;P99&nbsp;ratio |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 33.6 | 14.0 | 2.40x | 27.90&nbsp;/&nbsp;60.90 | 66.30&nbsp;/&nbsp;138.80 | 2.38x&nbsp;/&nbsp;2.28x |
+| 8 | 49.2 | 39.5 | 1.25x | 163.80&nbsp;/&nbsp;248.10 | 175.00&nbsp;/&nbsp;416.30 | 1.07x&nbsp;/&nbsp;1.68x |
+| 64 | 47.5 | 43.7 | 1.09x | 1262.70&nbsp;/&nbsp;1443.90 | 1184.80&nbsp;/&nbsp;2394.80 | 0.94x&nbsp;/&nbsp;1.66x |
 
 </details>
 
 <details>
-<summary><strong>von</strong></summary>
+<summary><strong>von</strong> (RTX 4090 24 GB)</summary>
 
 **GPU**
 
@@ -501,7 +568,7 @@ At image and video `c=64`, `qev` completed **zero** responses inside the 10-seco
 | 8 | 536.4 | 31.2 | 17.2x | 14.86&nbsp;/&nbsp;16.61 | 250.91&nbsp;/&nbsp;435.99 | 16.9&nbsp;/&nbsp;26.2x |
 | 64 | 1476.1 | 22.3 | 66.1x | 42.58&nbsp;/&nbsp;53.24 | 2848.80&nbsp;/&nbsp;3333.40 | 66.9&nbsp;/&nbsp;62.6x |
 
-**CPU**
+**CPU** (AMD EPYC 7543)
 
 | concurrency | Verdict&nbsp;rps | `von serve`&nbsp;rps | rps&nbsp;ratio | Verdict&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | `von serve`&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | P50&nbsp;/&nbsp;P99&nbsp;ratio |
 |---|---:|---:|---:|---:|---:|---:|
@@ -512,7 +579,7 @@ At image and video `c=64`, `qev` completed **zero** responses inside the 10-seco
 </details>
 
 <details>
-<summary><strong>laya-multilingual</strong></summary>
+<summary><strong>laya-multilingual</strong> (RTX 4090 24 GB)</summary>
 
 **GPU**
 
@@ -522,7 +589,7 @@ At image and video `c=64`, `qev` completed **zero** responses inside the 10-seco
 | 8 | 553.4 | 46.3 | 11.9x | 13.99&nbsp;/&nbsp;19.79 | 184.36&nbsp;/&nbsp;204.24 | 13.2&nbsp;/&nbsp;10.3x |
 | 64 | 2534.4 | refused&nbsp;requests | — | 24.67&nbsp;/&nbsp;32.23 | refused&nbsp;requests | — |
 
-**CPU**
+**CPU** (AMD EPYC 7543)
 
 | concurrency | Verdict&nbsp;rps | `laya-serve`&nbsp;rps | rps&nbsp;ratio | Verdict&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | `laya-serve`&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | P50&nbsp;/&nbsp;P99&nbsp;ratio |
 |---|---:|---:|---:|---:|---:|---:|
@@ -533,7 +600,7 @@ At image and video `c=64`, `qev` completed **zero** responses inside the 10-seco
 </details>
 
 <details>
-<summary><strong>laya</strong></summary>
+<summary><strong>laya</strong> (RTX 4090 24 GB)</summary>
 
 **GPU**
 
@@ -543,7 +610,7 @@ At image and video `c=64`, `qev` completed **zero** responses inside the 10-seco
 | 8 | 501.4 | 35.4 | 14.2x | 15.99&nbsp;/&nbsp;22.42 | 227.96&nbsp;/&nbsp;250.60 | 14.3&nbsp;/&nbsp;11.2x |
 | 64 | 1353.0 | refused&nbsp;requests | — | 46.71&nbsp;/&nbsp;65.19 | refused&nbsp;requests | — |
 
-**CPU**
+**CPU** (AMD EPYC 7543)
 
 | concurrency | Verdict&nbsp;rps | `laya-serve`&nbsp;rps | rps&nbsp;ratio | Verdict&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | `laya-serve`&nbsp;P50&nbsp;/&nbsp;P99&nbsp;(ms) | P50&nbsp;/&nbsp;P99&nbsp;ratio |
 |---|---:|---:|---:|---:|---:|---:|
@@ -555,37 +622,61 @@ At image and video `c=64`, `qev` completed **zero** responses inside the 10-seco
 
 ## Correctness
 
-Verdict runs its own inference pipeline, graded against a golden standard: the official SDK's offline output on CPU fp32. In accuracy PKs, Verdict and the model author's own server are graded against the same golden standard on one RTX 4090 (CUDA) — worst-case deviation across the whole corpus:
+Verdict runs its own inference pipeline, graded against a golden standard: the official SDK's offline output on CPU fp32. In accuracy PKs, Verdict and the model author's own server are graded against the same golden standard on one CUDA host per model (RTX 4090; A100 for the OneJev1.6 9b and 27b tiers) — worst-case deviation across the whole corpus:
 
 | Model | Verdict | official&nbsp;server | result |
 |---|---:|---:|:--|
 | laya | 0.0 | 0.943 | Verdict ahead |
 | laya-multilingual | 1e-4 | 1.74 | Verdict ahead |
 | von | 0.0 | 0.0 | tied |
-| decider-2b | 2.00e-2 | 1.35e-2 | tied |
+| decider-2b | 1.00e-2 | 1.09e-2 | tied |
 | OneJev1.6-0.8b | 2.49e-2 | 8.55e-1 | Verdict ahead |
 | OneJev1.6-4b | 4.95e-2 | 9.03e-1 | Verdict ahead |
-| OneJev1.6-9b | 4.59e-2 | 8.99e-1 | Verdict ahead |
+| OneJev1.6-9b | 3.91e-2 | 8.97e-1 | Verdict ahead |
+| OneJev1.6-27b | 7.34e-2 | 7.80e-1 | Verdict ahead |
 
-## Configuration
+## Commands and Configuration
 
-One subcommand: `verdict serve <MODEL_DIR_OR_REPO>`.
+### serve
+
+`verdict serve (<repo>[:variant] | <model_dir>)`
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--host` / `--port` | 127.0.0.1&nbsp;/&nbsp;8080 | address and port to serve on |
 | `--device` | auto | `auto` uses CUDA when available, else CPU; `cpu` / `cuda` force the choice |
-| `--max-batch-size` | 8 | max requests per batch |
-| `--batch-window-ms` | 5 | upper bound on batch accumulation time, reached only when `--max-batch-size` is large relative to this window; a batch ships sooner when it fills up or after 0.5&nbsp;ms of arrival silence |
+| `--max-batch-size` | 16 | scheduler batch cap in rows |
+| `--token-budget` | 16384 | tokens a batch may hold; rows per batch are capped at budget / length class |
+| `--graph-max-len` | 1024 | longest prompt whose forward the torch runtime captures into a CUDA graph; longer prompts run eagerly, and a device without room for the ladder lowers the ceiling itself |
+| `--gpu-memory-utilization` | 0.92 | fraction of GPU memory this instance may use — weights, CUDA graphs, caches; co-located servers each declare their share |
+| `--fork-graph-max-prefix` | 4096 | longest shared prefix covered by the fork graphs; longer prefixes run the eager fork |
+| `--fork-graph-max-width` | 64 | longest branch suffix covered by the fork graphs; longer suffixes run the eager fork |
+| `--batch-window-ms` | 5 | batch accumulation time cap; a batch ships sooner when it fills up or after 0.5&nbsp;ms of arrival silence |
 | `--max-input-tokens` | off | reject rendered prompts longer than this; unset, an over-long prompt is truncated at the model's declared `max_len`, same as the official SDK |
 | `--max-body-mb` | 64 | request body size cap in MiB |
 | `--queue-cap` | 1024 | max queued requests; excess requests are rejected with 503 |
 | `--served-model-name` | model directory's name | the model name clients address |
-| `--policy` | fcfs | `fcfs` serves in arrival order; `priority` serves lower request priority first |
+| `--policy` | shape | `shape` groups rows of one length class into batches, so one long row cannot pad a whole batch; `fcfs` serves in arrival order; `priority` serves lower request priority first |
 | `--data-parallel` | 1 | N engine replicas; helps on many-core CPU hosts |
 | `--force-download` | — | if passed, re-download the model package instead of using the cache |
 
-Environment variables:
+### download
+
+`verdict download <repo> <local_dir>`
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--progress json` | — | one JSON progress event per line on stdout, logs on stderr — for tools driving Verdict as a subprocess |
+
+### convert
+
+`verdict convert <local_dir> <output_local_dir>`
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--progress json` | — | same as on `download` |
+
+### Environment variables
 
 | Variable | Effect |
 |---|---|
@@ -595,6 +686,51 @@ Environment variables:
 | `MODELSCOPE_API_TOKEN` | Auth for ModelScope repos. |
 | `VERDICT_CACHE` | Model cache root; default `$XDG_CACHE_HOME/verdict`, i.e. `~/.cache/verdict`. |
 | `ORT_DYLIB_PATH` | Path to the onnxruntime library; default: the model's `lib/` or beside the binary. |
+
+## Optimization
+
+### What `/graph` says
+
+At boot Verdict compiles the shapes within the ranges you declared into CUDA graphs — the fast path; shapes that do not fit, or fall outside those ranges, run the ordinary path (slower). `/graph` reports two things:
+
+- whether boot captured every planned graph — planned against captured;
+- what share of requests took the slow path under traffic, and why.
+
+`curl http://<host>:<port>/graph` returns the JSON.
+
+### When tuning is done
+
+After a run of your own real traffic (at least ten minutes), the ideal reading is:
+
+- every slow-path ratio at 0: `eager.len`, `eager.degraded` and `fork.degraded` all 0;
+- every graph captured: `cells.text.captured` equals `cells.text.planned`, and `cells.fork.captured` equals `cells.fork.planned`.
+
+At that point the parameters are as good as they get — stop there.
+
+### Fix what you see
+
+| You see | Meaning | Move |
+|---|---|---|
+| `eager.len` above 0 | your prompts exceed the `--graph-max-len` ceiling; those requests keep taking the slow path | double `--graph-max-len` — 1024 → 2048 → 4096 — restart and re-measure |
+| `cells.text.captured` below `cells.text.planned` | the card could not hold every text graph at boot | halve `--graph-max-len` — 1024 → 512 → 256, down to 64 if needed — restart and re-measure |
+| `eager.degraded` above 0 | requests hit text cells that did not capture | same as above: halve `--graph-max-len` |
+| `cells.fork.captured` below `cells.fork.planned` | the card could not hold every fork graph at boot | halve `--fork-graph-max-width` — 64 → 32 → 16 — restart and re-measure |
+| `fork.degraded` above 0 | rows hit fork cells that did not capture | same as above: halve `--fork-graph-max-width` |
+
+Two notes:
+
+- Cells that did not capture are visible right after boot, no load needed; the degraded ratios appear only after traffic.
+- If cells would not capture, look at `nvidia-smi` first: when another process holds the card, free the card — no flag fixes that.
+
+### Steps
+
+1. Drive your own real workload for at least ten minutes. Confirm it saturates first: `verdict_queue_depth` on `/metrics` clearly above 0. An empty queue means the client is not saturating the server, and any "tuning changed nothing" read then is an artifact.
+2. Read `/graph` once and write down the requests-per-second as the baseline.
+3. Against the table above, **change one parameter at a time**, restart, re-measure under the same traffic.
+4. If requests-per-second rose, keep the change; if it did not, or got slower, revert it. Either way, return to step 2 for the next reading.
+5. Try at most two values per parameter; when both are tried without a gain, stop — the parameters are at their ceiling.
+
+Note: always verify with requests-per-second. Better graph coverage is not the same as faster serving — measured once, coverage went from 90% to 100% and serving got slower. Speed is the criterion.
 
 ## Requirements
 
@@ -613,7 +749,7 @@ Apache-2.0
 
 ## Acknowledgments
 
-Several recipes reimplement behaviour specified by the official implementations
-of the models they serve, and parts of the scheduler follow published design
-patterns from other serving projects. The projects, their licenses and what we
-take from each are listed in [NOTICE](NOTICE).
+Several model-family converters reimplement behaviour specified by the official
+implementations of the models they serve, and parts of the scheduler follow
+published design patterns from other serving projects. The projects, their
+licenses and what we take from each are listed in [NOTICE](NOTICE).

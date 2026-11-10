@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 — 2026-11-10
+
+- **Engine upgrade, faster**: substantially higher performance — decider-2b, for example, beats the official vLLM deployment on the same machine at all three concurrency levels, 2.40x / 1.25x / 1.09x throughput, with P99 latency ahead at every level.
+- **verdict convert**: any encoder checkpoint of a supported family — a newer official release, a community fine-tune — becomes a verdict-ready package: `verdict download` fetches it, `verdict convert` converts it, `verdict serve` serves it.
+- **Performance tuning with `/graph`**: the new `/graph` endpoint reports CUDA-graph coverage and gaps; tune the parameters against the gaps and more requests take the fast path.
+- **Multiple instances per GPU**: `--gpu-memory-utilization` declares each instance's share of GPU memory, so one GPU runs several model instances at once.
+
+Images on Docker Hub: `sgyaqing/verdict:0.4.0-cpu`, `:0.4.0-cuda` and `:0.4.0-convert` (linux/amd64).
+
 ## 0.3.0 — 2026-10-26
 
 - **First multimodal family**: `verdict-models/OneJev1.6` (0.8b / 4b / 9b / 27b) — images and video on `/v1/systemone` (TypeSafe `assets`), images on `/v1/decisions` (OpenAI `input_image`), answers verified against the official model, hosted on both Hugging Face and ModelScope.

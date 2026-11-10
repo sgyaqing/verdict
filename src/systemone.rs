@@ -1110,6 +1110,7 @@ async fn system_one(
         .iter()
         .map(|(qid, raw)| prepare(qid, raw, family))
         .collect::<Result<_, _>>()?;
+    let request = pool.next_request();
     let results = try_join_all(prepared.iter().map(|p| {
         let media = media.clone();
         let state = state.clone();
@@ -1117,7 +1118,15 @@ async fn system_one(
         async move {
             let started = Instant::now();
             let result = pool
-                .run_task(p.task, &p.instructions, &state, &p.options, &media, 0)
+                .run_task(
+                    p.task,
+                    &p.instructions,
+                    &state,
+                    &p.options,
+                    &media,
+                    0,
+                    request,
+                )
                 .await;
             if result.is_ok() {
                 metrics::record_decision(p.task, started.elapsed().as_millis() as u64);

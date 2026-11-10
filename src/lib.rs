@@ -1,13 +1,16 @@
 pub mod calibration;
 pub mod cli;
 pub mod compat;
+pub mod convert;
 pub mod decisions;
 pub mod engine;
 pub mod family;
+pub mod graph_stats;
 pub mod manifest;
 pub mod metrics;
 pub mod model_source;
 pub mod pipeline;
+pub mod progress;
 pub mod protocol;
 pub mod replay;
 pub mod scheduler;
@@ -19,6 +22,16 @@ use std::sync::Arc;
 pub fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+}
+
+pub fn init_tracing_stderr() {
+    use tracing_subscriber::EnvFilter;
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -44,8 +57,8 @@ pub async fn run_server(
         Some(n) => {
             if n > bundle.layout.max_len {
                 tracing::warn!(
-                    "--max-input-tokens {n} exceeds the model's declared max_len {}; \
-                     requests past that are silently truncated by the model layer",
+                    "max-input-tokens {n} exceeds the model's max_len {}; longer \
+                     requests are truncated",
                     bundle.layout.max_len
                 );
             }
@@ -56,6 +69,9 @@ pub async fn run_server(
     let calibration = calibration::CalibrationConfig::load(&cfg.model_dir)
         .map_err(|err| format!("model dir {}: {err}", cfg.model_dir.display()))?;
     let policy: Arc<dyn scheduler::SchedulingPolicy> = match cfg.policy {
+        cli::PolicyChoice::Shape => {
+            Arc::new(scheduler::ShapeAware::new(engines[0].shape_buckets()))
+        }
         cli::PolicyChoice::Fcfs => Arc::new(scheduler::Fcfs),
         cli::PolicyChoice::Priority => Arc::new(scheduler::Priority),
     };
@@ -72,7 +88,7 @@ pub async fn run_server(
                 cfg.queue_cap,
                 cfg.max_batch_size,
                 cfg.batch_window_ms,
-                bundle.layout.max_len,
+                cfg.token_budget,
             ),
             bundle.layout.clone(),
             Arc::clone(&policy),
@@ -99,7 +115,7 @@ pub async fn run_server(
     let app = protocol::router(Arc::clone(&pool), cfg.max_body_mb * 1024 * 1024);
     let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, model_dir = %cfg.model_dir.display(), "verdict listening (press Ctrl-C to stop)");
+    tracing::info!(%addr, "listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

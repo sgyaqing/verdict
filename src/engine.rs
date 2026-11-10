@@ -32,6 +32,10 @@ pub trait Engine: Send + Sync {
         false
     }
 
+    fn shape_buckets(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
     fn health(&self) -> bool;
 }
 

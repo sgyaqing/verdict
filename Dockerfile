@@ -22,5 +22,5 @@ LABEL org.opencontainers.image.title="Verdict" \
       org.opencontainers.image.url="https://github.com/sgyaqing/verdict" \
       org.opencontainers.image.licenses="Apache-2.0"
 
-COPY --from=bin /verdict /usr/local/bin/verdict
-COPY LICENSE NOTICE /usr/share/licenses/verdict/
+COPY verdict /usr/local/bin/verdict
+COPY LICENSE NOTICE LICENSES /usr/share/licenses/verdict/
